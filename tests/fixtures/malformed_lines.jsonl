@@ -1,0 +1,5 @@
+
+not json
+[]
+{"sequence":1,"captured_at":"2026-01-01T00:00:00+00:00","source":"mock","snapshot":null}
+{"sequence":2,"captured_at":"2026-01-01T00:00:01+00:00","source":"mock","snapshot":{"game_status":"pre_match","blue_points":0,"orange_points":0,"teams":[]}}
