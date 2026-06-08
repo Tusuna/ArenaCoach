@@ -17,11 +17,19 @@ Then close and reopen PowerShell.
 
 ## Setup
 
-From the ArenaCoach folder:
+Recommended quick check:
 
 ```powershell
-.\scripts\setup_windows.ps1
+.\scripts\check_setup.bat
 ```
+
+If setup is needed, run:
+
+```powershell
+.\scripts\setup_windows.bat
+```
+
+You can still run the `.ps1` versions from an existing PowerShell window, but the `.bat` launchers are easier for most testers.
 
 When setup finishes, launch Arena Coach by double-clicking:
 
@@ -70,6 +78,6 @@ Those contain your local data.
 
 ## Quick Troubleshooting
 
-- If setup fails, run `scripts\check_setup.ps1`
+- If setup fails, run `scripts\check_setup.bat`
 - If the app does not open, run `run_arena_coach_debug.bat`
 - If something looks wrong, export your data and send the zip plus a screenshot to the developer
