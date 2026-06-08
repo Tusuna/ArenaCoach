@@ -1,0 +1,10 @@
+data/
+logs/
+exports/
+imports/
+backups/
+arena_coach_config.json
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
