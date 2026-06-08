@@ -18,7 +18,7 @@ Arena Coach is its own program. Schrodinger's Observer was used only as research
 - export/import/backup tools
 - PySide6 desktop GUI and CLI
 
-Current automated tests: `75`, passing.
+Current automated tests: `76`, passing.
 
 ## Main GUI Tabs
 
@@ -40,7 +40,13 @@ Top-level tabs stay fixed. Card-based tabs support saved order and saved heights
 ### Normal Windows tester flow
 
 ```powershell
-.\scripts\setup_windows.ps1
+.\scripts\check_setup.bat
+```
+
+If setup is needed:
+
+```powershell
+.\scripts\setup_windows.bat
 ```
 
 Then launch:
