@@ -1,11 +1,11 @@
 $ErrorActionPreference = "Stop"
 
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).ProviderPath
-$zipPath = Join-Path $projectRoot "ArenaCoach_TestBuild.zip"
-$tempBase = [System.IO.Path]::GetTempPath()
-$stagingRoot = Join-Path $tempBase ("ArenaCoach_TestBuild_" + [System.Guid]::NewGuid().ToString("N"))
+$outputPath = Join-Path $projectRoot "ArenaCoach_TestBuild.zip"
+$stagingRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("ArenaCoach_TestBuild_" + [guid]::NewGuid().ToString("N"))
+$stagingProject = Join-Path $stagingRoot "ArenaCoach"
 
-$excludedDirectoryNames = @(
+$excludeDirNames = @(
     ".venv",
     "data",
     "logs",
@@ -17,60 +17,72 @@ $excludedDirectoryNames = @(
     ".git"
 )
 
-$excludedFileNames = @(
-    "arena_coach_config.json",
-    "ArenaCoach_TestBuild.zip"
+$excludeFileNames = @(
+    "arena_coach_config.json"
 )
 
-function Test-IsExcluded {
+$excludeExtensions = @(
+    ".pyc"
+)
+
+function Copy-IncludedFiles {
     param(
         [Parameter(Mandatory = $true)]
-        [System.IO.FileInfo] $File
+        [string] $SourceRoot,
+
+        [Parameter(Mandatory = $true)]
+        [string] $TargetRoot
     )
 
-    if ($excludedFileNames -contains $File.Name) {
-        return $true
-    }
-
-    if ($File.Extension -eq ".pyc") {
-        return $true
-    }
-
-    $relativePath = $File.FullName.Substring($projectRoot.Length).TrimStart("\", "/")
-    $parts = $relativePath -split "[\\/]+"
-    foreach ($part in $parts) {
-        if ($excludedDirectoryNames -contains $part) {
-            return $true
+    Get-ChildItem -LiteralPath $SourceRoot -Recurse -Force | ForEach-Object {
+        $fullPath = $_.FullName
+        $relativePath = $fullPath.Substring($SourceRoot.Length).TrimStart('\')
+        if ([string]::IsNullOrWhiteSpace($relativePath)) {
+            return
         }
+
+        $pathParts = $relativePath -split '[\\/]'
+        foreach ($part in $pathParts) {
+            if ($excludeDirNames -contains $part) {
+                return
+            }
+        }
+
+        if ($_.PSIsContainer) {
+            return
+        }
+
+        if ($excludeFileNames -contains $_.Name) {
+            return
+        }
+
+        if ($excludeExtensions -contains $_.Extension) {
+            return
+        }
+
+        $targetPath = Join-Path $TargetRoot $relativePath
+        $targetDirectory = Split-Path -Parent $targetPath
+        if (-not (Test-Path -LiteralPath $targetDirectory)) {
+            New-Item -ItemType Directory -Path $targetDirectory -Force | Out-Null
+        }
+        Copy-Item -LiteralPath $fullPath -Destination $targetPath -Force
     }
-
-    return $false
 }
-
-if (Test-Path -LiteralPath $zipPath) {
-    Remove-Item -LiteralPath $zipPath -Force
-}
-
-New-Item -ItemType Directory -Path $stagingRoot -Force | Out-Null
 
 try {
-    Get-ChildItem -LiteralPath $projectRoot -Recurse -Force -File |
-        Where-Object { -not (Test-IsExcluded $_) } |
-        ForEach-Object {
-            $relativePath = $_.FullName.Substring($projectRoot.Length).TrimStart("\", "/")
-            $destination = Join-Path $stagingRoot $relativePath
-            $destinationDirectory = Split-Path -Parent $destination
-            New-Item -ItemType Directory -Path $destinationDirectory -Force | Out-Null
-            Copy-Item -LiteralPath $_.FullName -Destination $destination -Force
-        }
+    if (Test-Path -LiteralPath $outputPath) {
+        Remove-Item -LiteralPath $outputPath -Force
+    }
 
-    Compress-Archive -Path (Join-Path $stagingRoot "*") -DestinationPath $zipPath -Force
-    Write-Host "Created $zipPath"
+    New-Item -ItemType Directory -Path $stagingProject -Force | Out-Null
+    Copy-IncludedFiles -SourceRoot $projectRoot -TargetRoot $stagingProject
+
+    Compress-Archive -Path (Join-Path $stagingProject "*") -DestinationPath $outputPath -Force
+    Write-Host "Created tester zip:"
+    Write-Host $outputPath
 }
 finally {
-    $resolvedStaging = (Resolve-Path $stagingRoot).ProviderPath
-    $resolvedTemp = (Resolve-Path $tempBase).ProviderPath
-    if ($resolvedStaging.StartsWith($resolvedTemp, [System.StringComparison]::OrdinalIgnoreCase)) {
-        Remove-Item -LiteralPath $resolvedStaging -Recurse -Force
+    if (Test-Path -LiteralPath $stagingRoot) {
+        Remove-Item -LiteralPath $stagingRoot -Recurse -Force
     }
 }

@@ -1,5 +1,8 @@
 $ErrorActionPreference = "Stop"
 
+$projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).ProviderPath
+Set-Location $projectRoot
+
 function Get-PythonCommand {
     $python = Get-Command python -ErrorAction SilentlyContinue
     if ($python) {
@@ -81,4 +84,5 @@ Write-Host 'python -m arena_coach.gui.app'
 Write-Host ""
 Write-Host "Friend/tester shortcut:"
 Write-Host '.\scripts\setup_windows.ps1'
+Write-Host 'or just double-click .\scripts\setup_windows.bat'
 Write-Host 'Then launch with run_arena_coach.pyw'
