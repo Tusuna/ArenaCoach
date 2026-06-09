@@ -1,7 +1,7 @@
 # Arena Coach
 
 Standalone Echo Arena personal evaluation app.
-
+MAKE SURE YOU HAVE PYTHON INSTALLED 
 Arena Coach is its own program. Schrodinger's Observer was used only as research and is not imported or required at runtime.
 
 ## What Works Now
