@@ -171,7 +171,7 @@ class Phase10ReleaseTests(unittest.TestCase):
         self.assertNotIn("Remove-Item", setup_script)
 
         launcher_script = Path("run_arena_coach.pyw").read_text(encoding="utf-8")
-        self.assertIn("os.execve", launcher_script)
+        self.assertIn("subprocess.Popen", launcher_script)
 
         tutorial_doc = Path("docs/user_tutorial.md")
         self.assertTrue(tutorial_doc.exists())

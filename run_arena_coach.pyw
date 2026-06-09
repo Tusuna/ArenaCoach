@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import os
 from pathlib import Path
+import subprocess
 import sys
 
 
@@ -26,11 +27,12 @@ def launch() -> int:
         env["PYTHONPATH"] = str(SRC) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
         try:
             os.chdir(ROOT)
-            os.execve(
-                str(executable),
+            subprocess.Popen(
                 [str(executable), "-m", "arena_coach.gui.app"],
-                env,
+                cwd=str(ROOT),
+                env=env,
             )
+            return 0
         except Exception as exc:
             show_error(
                 "Arena Coach could not launch from the local virtual environment.\n\n"
@@ -38,7 +40,6 @@ def launch() -> int:
                 "Run scripts\\setup_windows.ps1 first."
             )
             return 1
-        return 0
 
     sys.path.insert(0, str(SRC))
     try:

@@ -146,6 +146,17 @@ def main() -> int:
         loading.close()
         QMessageBox.critical(None, "Arena Coach Config Error", str(exc))
         return 2
+    except Exception as exc:  # noqa: BLE001
+        loading.close()
+        QMessageBox.critical(
+            None,
+            "Arena Coach Startup Error",
+            "Arena Coach hit an unexpected startup error.\n\n"
+            f"{exc}\n\n"
+            "If this build was copied from another PC, try launching again after this update. "
+            "If it still fails, delete arena_coach_config.json in the ArenaCoach folder and relaunch.",
+        )
+        return 1
     window.show()
     window.raise_()
     window.activateWindow()

@@ -4,7 +4,7 @@
   "echo_api_path": "/session",
   "poll_interval_seconds": 0.5,
   "request_timeout_seconds": 1.0,
-  "raw_log_dir": "C:\\Users\\User\\Documents\\coding\\echo coacher\\ArenaCoach\\logs\\raw",
-  "database_path": "C:\\Users\\User\\Documents\\coding\\echo coacher\\ArenaCoach\\data\\arena_coach.db",
+  "raw_log_dir": "logs\\raw",
+  "database_path": "data\\arena_coach.db",
   "use_guided_match_review": true
 }

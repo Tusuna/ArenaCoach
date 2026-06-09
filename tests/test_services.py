@@ -90,6 +90,26 @@ class ServiceTests(unittest.TestCase):
         stats = StatsPreviewService(self.database_path).summary()
         self.assertEqual(stats["total_finalized_matches"], 0)
 
+    def test_load_config_heals_copied_absolute_paths_to_local_project_root(self):
+        config_path = self.root / "arena_coach_config.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "database_path": "Z:\\copied\\ArenaCoach\\data\\arena_coach.db",
+                    "raw_log_dir": "Z:\\copied\\ArenaCoach\\logs\\raw",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        config = load_config(config_path)
+
+        self.assertEqual(config.database_path, (self.root / "data" / "arena_coach.db").resolve())
+        self.assertEqual(config.raw_log_dir, (self.root / "logs" / "raw").resolve())
+        saved = json.loads(config_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["database_path"], "data\\arena_coach.db")
+        self.assertEqual(saved["raw_log_dir"], "logs\\raw")
+
     def test_private_match_type_service_updates_display_name(self):
         result = import_raw_log(FIXTURES / "simple_match.jsonl", self.database_path)
         service = MatchService(self.database_path)

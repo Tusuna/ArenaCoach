@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -82,8 +83,8 @@ def load_config(config_path: Optional[Path] = None) -> AppConfig:
         resolved_config_path.parent.mkdir(parents=True, exist_ok=True)
         resolved_config_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
-    raw_log_dir = _resolve_path(data["raw_log_dir"], project_root)
-    database_path = _resolve_path(data["database_path"], project_root)
+    raw_log_dir = _resolve_path(data["raw_log_dir"], project_root, Path("logs") / "raw")
+    database_path = _resolve_path(data["database_path"], project_root, Path("data") / "arena_coach.db")
 
     config = AppConfig(
         project_root=project_root,
@@ -115,8 +116,14 @@ def save_config_values(config_path: Optional[Path], values: Dict[str, Any]) -> A
         "echo_api_path": _normalize_api_path(data["echo_api_path"]),
         "poll_interval_seconds": float(data["poll_interval_seconds"]),
         "request_timeout_seconds": float(data["request_timeout_seconds"]),
-        "raw_log_dir": str(_resolve_path(data["raw_log_dir"], project_root)),
-        "database_path": str(_resolve_path(data["database_path"], project_root)),
+        "raw_log_dir": _serialize_path(
+            _resolve_path(data["raw_log_dir"], project_root, Path("logs") / "raw"),
+            project_root,
+        ),
+        "database_path": _serialize_path(
+            _resolve_path(data["database_path"], project_root, Path("data") / "arena_coach.db"),
+            project_root,
+        ),
         "use_guided_match_review": _bool(data.get("use_guided_match_review"), True),
     }
     resolved_config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -134,11 +141,24 @@ def ensure_runtime_directories(config: AppConfig) -> None:
     config.database_path.parent.mkdir(parents=True, exist_ok=True)
 
 
-def _resolve_path(value: Any, project_root: Path) -> Path:
+def _resolve_path(value: Any, project_root: Path, default_relative: Path) -> Path:
+    default_path = (project_root / default_relative).resolve()
     path = Path(str(value)).expanduser()
     if not path.is_absolute():
-        path = project_root / path
-    return path.resolve()
+        return (project_root / path).resolve()
+
+    path = path.resolve(strict=False)
+    if _is_relative_to(path, project_root):
+        return path
+    if path.exists():
+        return path
+
+    ancestor = _closest_existing_ancestor(path)
+    if ancestor is None:
+        return default_path
+    if not os.access(ancestor, os.W_OK):
+        return default_path
+    return path
 
 
 def _write_config(config: AppConfig) -> None:
@@ -148,8 +168,8 @@ def _write_config(config: AppConfig) -> None:
         "echo_api_path": config.echo_api_path,
         "poll_interval_seconds": config.poll_interval_seconds,
         "request_timeout_seconds": config.request_timeout_seconds,
-        "raw_log_dir": str(config.raw_log_dir),
-        "database_path": str(config.database_path),
+        "raw_log_dir": _serialize_path(config.raw_log_dir, config.project_root),
+        "database_path": _serialize_path(config.database_path, config.project_root),
         "use_guided_match_review": config.use_guided_match_review,
     }
     config.config_path.write_text(json.dumps(normalized, indent=2) + "\n", encoding="utf-8")
@@ -168,3 +188,28 @@ def _bool(value: Any, default: bool = False) -> bool:
     if isinstance(value, bool):
         return value
     return str(value).strip().casefold() in {"true", "1", "yes", "on"}
+
+
+def _serialize_path(path: Path, project_root: Path) -> str:
+    resolved = Path(path).resolve(strict=False)
+    if _is_relative_to(resolved, project_root):
+        return str(resolved.relative_to(project_root))
+    return str(resolved)
+
+
+def _closest_existing_ancestor(path: Path) -> Optional[Path]:
+    current = Path(path)
+    while True:
+        if current.exists():
+            return current
+        if current.parent == current:
+            return None
+        current = current.parent
+
+
+def _is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
