@@ -28,6 +28,7 @@ from arena_coach.inference import AdvancedInferenceService
 from arena_coach.parsing.event_deriver import derive_events
 from arena_coach.parsing.raw_log_reader import read_raw_log
 from arena_coach.repositories import matches_repo, players_repo, profiles_repo
+from arena_coach.services.advanced_analysis_service import AdvancedAnalysisService
 from arena_coach.services.match_display import build_match_display_name
 from arena_coach.services.data_exchange_service import DataExchangeService
 from arena_coach.services.stats_service import DatabaseStatsService
@@ -225,6 +226,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     stats_quality = stats_commands.add_parser("quality", help="Show match quality classification.")
     _add_stats_filter_arguments(stats_quality)
+
+    stats_categories = stats_commands.add_parser("categories", help="Show advanced category scores for the active profile.")
+    _add_stats_filter_arguments(stats_categories)
+
+    stats_export_metrics = stats_commands.add_parser(
+        "export-metrics",
+        help="Export per-player averages and advanced category metrics for formula tuning.",
+    )
+    stats_export_metrics.add_argument("--output", type=Path, default=None, help="Optional JSON output path.")
+    _add_stats_filter_arguments(stats_export_metrics)
 
     stats_player = stats_commands.add_parser("player", help="Show aggregate stats for one canonical player.")
     stats_player.add_argument("player_id", type=int)
@@ -425,6 +436,7 @@ def run_stats_command(config: AppConfig, args: argparse.Namespace) -> int:
         return 2
 
     service = DatabaseStatsService(config.database_path)
+    advanced_service = AdvancedAnalysisService(config.database_path)
     filters = _build_stats_filters(args)
 
     if args.stats_command == "summary":
@@ -443,8 +455,24 @@ def run_stats_command(config: AppConfig, args: argparse.Namespace) -> int:
         quality_filters = filters.with_updates(finalized_only=False)
         _print_quality(service.quality(quality_filters), quality_filters)
         return 0
+    if args.stats_command == "categories":
+        _print_category_scores(advanced_service.local_user_summary(filters=filters), filters)
+        return 0
+    if args.stats_command == "export-metrics":
+        payload = advanced_service.export_metric_tuning_report(filters=filters)
+        output_path = Path(args.output).resolve() if getattr(args, "output", None) else _default_metric_export_path(config)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        print(f"metric report created: {output_path}")
+        print(f"players exported: {payload.get('player_count', 0)}")
+        print(f"category scoring mode: {payload.get('filters', {}).get('category_scoring_mode', 'mistake_adjusted')}")
+        return 0
     if args.stats_command == "player":
-        _print_player_summary(service.player(args.player_id, filters), filters)
+        _print_player_summary(
+            service.player(args.player_id, filters),
+            filters,
+            advanced_service.player_metric_summary(args.player_id, filters),
+        )
         return 0
 
     print("stats command required", file=sys.stderr)
@@ -780,6 +808,7 @@ def _add_stats_filter_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--include-guests", action="store_true", help="Include guest or unmapped players where supported.")
     parser.add_argument("--include-afk", action="store_true", help="Include suspected AFK players where supported.")
     parser.add_argument("--private-type", type=str, default=None, choices=PRIVATE_MATCH_TYPES, help="Filter private matches by subtype.")
+    parser.add_argument("--mode", choices=("production_only", "mistake_adjusted"), default="mistake_adjusted", help="Category scoring mode for advanced category views.")
     parser.add_argument("--last", type=int, default=None, help="Limit to the most recent N matches.")
     parser.add_argument("--from-date", type=str, default=None, help="Inclusive start date in YYYY-MM-DD format.")
     parser.add_argument("--to-date", type=str, default=None, help="Inclusive end date in YYYY-MM-DD format.")
@@ -822,6 +851,7 @@ def _build_stats_filters(args: argparse.Namespace) -> StatsFilter:
         include_guest_players=bool(getattr(args, "include_guests", False)),
         include_afk_players=bool(getattr(args, "include_afk", False)),
         private_match_type=normalize_private_match_type(getattr(args, "private_type", None), allow_none=True),
+        category_scoring_mode=str(getattr(args, "mode", "mistake_adjusted") or "mistake_adjusted"),
         from_date=_parse_date(getattr(args, "from_date", None)),
         to_date=_parse_date(getattr(args, "to_date", None)),
         last_n=getattr(args, "last", None),
@@ -1136,7 +1166,50 @@ def _print_advanced_player(payload: dict[str, Any]) -> None:
     _print_advanced_timeline(payload.get("timeline") or [])
 
 
-def _print_player_summary(summary: dict[str, object], filters: StatsFilter) -> None:
+def _print_category_scores(payload: dict[str, object], filters: StatsFilter) -> None:
+    print("Category Scores")
+    _print_filter_summary(filters)
+    active_profile = payload.get("active_profile") or {}
+    if active_profile:
+        print(f"active profile: {active_profile.get('display_name')} ({active_profile.get('primary_echo_name') or 'no Echo name'})")
+    canonical_names = payload.get("canonical_player_names") or []
+    if canonical_names:
+        print(f"self player(s): {', '.join(str(name) for name in canonical_names)}")
+    print(f"scoring mode: {str(payload.get('category_scoring_mode') or 'mistake_adjusted').replace('_', ' ')}")
+    if payload.get("display_overall_score") is not None:
+        print(f"display rating: {float(payload.get('display_overall_score')):.1f}")
+    if payload.get("absolute_overall_score") is not None:
+        print(f"absolute rating: {float(payload.get('absolute_overall_score')):.1f}")
+    if payload.get("display_percentile") is not None:
+        print(f"relative percentile: {float(payload.get('display_percentile')):.1f}")
+    print(f"rounds considered: {float(payload.get('metric_rounds_considered', 0.0)):.2f}")
+    warnings = payload.get("warnings") or []
+    for warning in warnings:
+        print(f"warning: {warning}")
+    if warnings:
+        print("")
+    rows = []
+    for key in ("shooting", "speed", "possession", "offense", "defense", "passing"):
+        category = (payload.get("category_breakdown") or {}).get(key) or {}
+        rows.append(
+            [
+                category.get("title") or key.title(),
+                _format_score_cell(category.get("display_score")),
+                _format_score_cell(category.get("final_score")),
+                _format_score_cell(category.get("base_score")),
+                f"-{float(category.get('mistake_penalty', 0.0)):.1f}",
+                f"{str(category.get('confidence_label') or 'unknown')} ({float(category.get('sample_confidence', 0.0)):.2f})",
+                ", ".join(category.get("main_mistake_inputs") or []) or "-",
+            ]
+        )
+    _print_table(["Category", "Display", "Absolute", "Base", "Penalty", "Confidence", "Notes"], rows)
+
+
+def _print_player_summary(
+    summary: dict[str, object],
+    filters: StatsFilter,
+    advanced_summary: Optional[dict[str, object]] = None,
+) -> None:
     print("Player Summary")
     _print_filter_summary(filters)
     print(f"player: {summary.get('display_name')} (#{summary.get('player_id')})")
@@ -1154,6 +1227,35 @@ def _print_player_summary(summary: dict[str, object], filters: StatsFilter) -> N
     averages = summary.get("averages") or {}
     rows = [[stat_name, f"{float(value):.2f}"] for stat_name, value in averages.items()]
     _print_table(["stat", "average"], rows)
+    if advanced_summary:
+        print("")
+        print("advanced category scores:")
+        print(f"scoring mode: {str(advanced_summary.get('category_scoring_mode') or 'mistake_adjusted').replace('_', ' ')}")
+        if advanced_summary.get("display_overall_score") is not None:
+            print(f"display rating: {float(advanced_summary.get('display_overall_score')):.1f}")
+        if advanced_summary.get("absolute_overall_score") is not None:
+            print(f"absolute rating: {float(advanced_summary.get('absolute_overall_score')):.1f}")
+        print(f"rounds considered: {float(advanced_summary.get('metric_rounds_considered', 0.0)):.2f}")
+        warnings = advanced_summary.get("warnings") or []
+        for warning in warnings:
+            print(f"warning: {warning}")
+        if warnings:
+            print("")
+        rows = []
+        for key in ("shooting", "speed", "possession", "offense", "defense", "passing"):
+            category = (advanced_summary.get("category_breakdown") or {}).get(key) or {}
+            rows.append(
+                [
+                    category.get("title") or key.title(),
+                    _format_score_cell(category.get("display_score")),
+                    _format_score_cell(category.get("final_score")),
+                    _format_score_cell(category.get("base_score")),
+                    f"-{float(category.get('mistake_penalty', 0.0)):.1f}",
+                    f"{str(category.get('confidence_label') or 'unknown')} ({float(category.get('sample_confidence', 0.0)):.2f})",
+                    ", ".join(category.get("main_mistake_inputs") or []) or "-",
+                ]
+            )
+        _print_table(["Category", "Display", "Absolute", "Base", "Penalty", "Confidence", "Notes"], rows)
 
 
 def _print_filter_summary(filters: StatsFilter) -> None:
@@ -1172,6 +1274,7 @@ def _print_filter_summary(filters: StatsFilter) -> None:
         f"include low quality: {'yes' if filters.include_low_quality else 'no'}",
         f"include AFK players: {'yes' if filters.include_afk_players else 'no'}",
         f"include guests: {'yes' if filters.include_guest_players else 'no'}",
+        f"category scoring mode: {str(getattr(filters, 'category_scoring_mode', 'mistake_adjusted')).replace('_', ' ')}",
     ]
     if filters.last_n is not None:
         lines.append(f"last matches: {filters.last_n}")
@@ -1188,6 +1291,17 @@ def _print_filter_summary(filters: StatsFilter) -> None:
     for line in lines:
         print(line)
     print("")
+
+
+def _format_score_cell(value: object) -> str:
+    if value is None:
+        return "--"
+    return f"{float(value):.1f}"
+
+
+def _default_metric_export_path(config: AppConfig) -> Path:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return config.exports_dir / f"arena_coach_metric_report_{timestamp}.json"
 
 
 def _print_table(headers: list[str], rows: list[list[object]]) -> None:

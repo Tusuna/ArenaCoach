@@ -15,6 +15,23 @@ from .spatial_models import OrientationModel, PlayerState, PossessionChain, Snap
 
 
 LIVE_SAMPLE_STATUSES = {"round_start", "playing", "score", "sudden_death"}
+ACTIVE_ACTIVITY_STAT_KEYS = (
+    "points",
+    "saves",
+    "goals",
+    "stuns",
+    "passes",
+    "catches",
+    "steals",
+    "blocks",
+    "interceptions",
+    "assists",
+    "shots_taken",
+    "possession_time",
+)
+INACTIVE_STREAK_THRESHOLD_SECONDS = 4.0
+ACTIVE_MOVEMENT_METERS = 0.75
+ACTIVE_VELOCITY_MPS = 0.35
 
 
 @dataclass
@@ -133,6 +150,10 @@ class PlayerMetricAccumulator:
             "active_seconds_observed": round(self.active_clock_seconds, 3),
             "active_rounds_estimated": round(self.active_rounds_estimated, 3),
             "round_length_seconds_estimated": round(self.round_length_seconds_estimated, 3),
+            "inactive_seconds_observed": round(float(self.metadata.get("inactive_seconds_observed") or 0.0), 3),
+            "movement_distance_observed": round(float(self.metadata.get("movement_distance_observed") or 0.0), 3),
+            "active_signal_samples": int(self.metadata.get("active_signal_samples") or 0),
+            "inactive_streak_threshold_seconds": INACTIVE_STREAK_THRESHOLD_SECONDS,
         }
 
 
@@ -189,36 +210,79 @@ def _apply_active_round_estimates(
                 key,
                 {
                     "active_seconds": 0.0,
-                    "fallback_seconds": 0.0,
+                    "inactive_seconds": 0.0,
                     "sample_count": 0,
                     "last_clock": None,
                     "last_time": None,
+                    "last_position": None,
+                    "last_velocity": 0.0,
+                    "last_stats": {},
+                    "last_possession": False,
+                    "inactive_streak": 0.0,
+                    "movement_distance": 0.0,
+                    "active_signal_samples": 0,
                 },
             )
             tracker["sample_count"] += 1
             clock = _normalized_clock_value(frame.game_clock, round_length_seconds)
             previous_clock = tracker["last_clock"]
-            if previous_clock is not None and clock is not None:
-                delta = previous_clock - clock
-                if 0.0 <= delta <= round_length_seconds:
+            delta = _player_sample_delta_seconds(
+                previous_clock,
+                clock,
+                tracker["last_time"],
+                current_time,
+                round_length_seconds,
+            )
+            movement_distance = _movement_distance(tracker["last_position"], player.best_position)
+            tracker["movement_distance"] += movement_distance
+            current_velocity = _vector_speed(player.velocity)
+            stat_changed = _stats_changed(tracker["last_stats"], player.stats)
+            possession_signal = bool(
+                player.possession
+                or tracker["last_possession"]
+                or _holding_disc(player.holding_left)
+                or _holding_disc(player.holding_right)
+            )
+            activity_signal = bool(
+                stat_changed
+                or possession_signal
+                or movement_distance >= ACTIVE_MOVEMENT_METERS
+                or current_velocity >= ACTIVE_VELOCITY_MPS
+            )
+            if delta > 0.0:
+                if activity_signal:
+                    tracker["active_signal_samples"] += 1
+                    inactive_streak = float(tracker["inactive_streak"] or 0.0)
+                    if 0.0 < inactive_streak <= INACTIVE_STREAK_THRESHOLD_SECONDS:
+                        tracker["active_seconds"] += inactive_streak
+                    elif inactive_streak > INACTIVE_STREAK_THRESHOLD_SECONDS:
+                        tracker["inactive_seconds"] += inactive_streak
+                    tracker["inactive_streak"] = 0.0
                     tracker["active_seconds"] += delta
-            if tracker["last_time"] is not None and current_time is not None:
-                elapsed = (current_time - tracker["last_time"]).total_seconds()
-                if 0.0 <= elapsed <= 10.0:
-                    tracker["fallback_seconds"] += elapsed
+                else:
+                    tracker["inactive_streak"] += delta
             tracker["last_clock"] = clock if clock is not None else tracker["last_clock"]
             tracker["last_time"] = current_time
+            tracker["last_position"] = player.best_position
+            tracker["last_velocity"] = current_velocity
+            tracker["last_stats"] = dict(player.stats or {})
+            tracker["last_possession"] = bool(player.possession)
 
     for key, accumulator in accumulators.items():
         tracker = trackers.get(key)
         active_seconds = 0.0
+        inactive_seconds = 0.0
         sample_count = 0
         if tracker is not None:
             active_seconds = float(tracker.get("active_seconds") or 0.0)
+            inactive_seconds = float(tracker.get("inactive_seconds") or 0.0)
             sample_count = int(tracker.get("sample_count") or 0)
-            if active_seconds <= 0.0:
-                active_seconds = min(float(tracker.get("fallback_seconds") or 0.0), round_length_seconds)
-            if active_seconds <= 0.0 and sample_count > 1:
+            trailing_inactive = float(tracker.get("inactive_streak") or 0.0)
+            if 0.0 < trailing_inactive <= INACTIVE_STREAK_THRESHOLD_SECONDS:
+                active_seconds += trailing_inactive
+            else:
+                inactive_seconds += trailing_inactive
+            if active_seconds <= 0.0 and sample_count > 1 and float(tracker.get("movement_distance") or 0.0) > 0.0:
                 active_seconds = min((sample_count - 1) * 0.5, round_length_seconds)
         accumulator.active_clock_seconds = round(active_seconds, 6)
         accumulator.round_length_seconds_estimated = round_length_seconds
@@ -227,6 +291,9 @@ def _apply_active_round_estimates(
             if round_length_seconds > 0.0 and active_seconds > 0.0
             else 0.0
         )
+        accumulator.metadata["inactive_seconds_observed"] = round(inactive_seconds, 6)
+        accumulator.metadata["movement_distance_observed"] = round(float(tracker.get("movement_distance") or 0.0), 6) if tracker is not None else 0.0
+        accumulator.metadata["active_signal_samples"] = int(tracker.get("active_signal_samples") or 0) if tracker is not None else 0
 
 
 def _estimated_round_length_seconds(
@@ -269,6 +336,47 @@ def _parse_captured_at(value: Optional[str]) -> Optional[datetime]:
         return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except ValueError:
         return None
+
+
+def _player_sample_delta_seconds(
+    previous_clock: Optional[float],
+    current_clock: Optional[float],
+    previous_time: Optional[datetime],
+    current_time: Optional[datetime],
+    round_length_seconds: float,
+) -> float:
+    if previous_clock is not None and current_clock is not None:
+        delta = float(previous_clock) - float(current_clock)
+        if 0.0 <= delta <= round_length_seconds:
+            return delta
+    if previous_time is not None and current_time is not None:
+        elapsed = (current_time - previous_time).total_seconds()
+        if 0.0 <= elapsed <= 10.0:
+            return float(elapsed)
+    return 0.0
+
+
+def _movement_distance(previous_position: Optional[tuple[float, float, float]], current_position: Optional[tuple[float, float, float]]) -> float:
+    distance = distance_3d(previous_position, current_position)
+    return float(distance or 0.0)
+
+
+def _vector_speed(vector: Optional[tuple[float, float, float]]) -> float:
+    if vector is None:
+        return 0.0
+    x_value, y_value, z_value = vector
+    return ((float(x_value) ** 2) + (float(y_value) ** 2) + (float(z_value) ** 2)) ** 0.5
+
+
+def _holding_disc(value: Optional[str]) -> bool:
+    return str(value or "").strip().casefold() == "disc"
+
+
+def _stats_changed(previous_stats: dict[str, float], current_stats: dict[str, float]) -> bool:
+    for key in ACTIVE_ACTIVITY_STAT_KEYS:
+        if float(current_stats.get(key) or 0.0) > float(previous_stats.get(key) or 0.0):
+            return True
+    return False
 
 
 def _initial_accumulators(match_id: int, rows: list[Any]) -> dict[str, PlayerMetricAccumulator]:

@@ -1,13 +1,23 @@
 from pathlib import Path
 import json
+import math
 import tempfile
 import unittest
 
 from arena_coach.database import connect_database, initialize_database
-from arena_coach.inference.spatial_models import AdvancedEvent
+from arena_coach.inference.player_metrics_analysis import PlayerMetricAccumulator, _apply_active_round_estimates
+from arena_coach.inference.spatial_models import AdvancedEvent, DiscState, PlayerState, SnapshotFrame
 from arena_coach.log_importer import import_raw_log
 from arena_coach.repositories import advanced_events_repo, advanced_player_metrics_repo, matches_repo, players_repo
-from arena_coach.services.advanced_analysis_service import AdvancedAnalysisService
+from arena_coach.services.advanced_analysis_service import (
+    AdvancedAnalysisService,
+    apply_hybrid_display_scores,
+    _category_score_entry,
+    _confidence_label,
+    _elite_curve_score,
+    _relative_percentile,
+    _sample_confidence,
+)
 from arena_coach.services.import_service import ImportService
 from arena_coach.services.match_service import MatchService
 from arena_coach.services.player_comparison_service import PlayerComparisonService
@@ -196,6 +206,8 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(alice["advanced_stats"]["avg_time_to_offense"], 2.0)
         self.assertEqual(alice["advanced_stats"]["avg_time_to_defense"], 3.0)
         self.assertEqual(alice["advanced_stats"]["shooting_percentage"], round((alice["goals"] / 2.0) * 100.0, 1))
+        self.assertIn("Bob", alice["advanced_stats"]["detail_tooltips"]["turnovers"])
+        self.assertIn("shooting", alice["advanced_stats"]["category_breakdown"])
         bob = detail["scoreboards"]["orange"][0]
         self.assertEqual(bob["advanced_stats"]["interceptions"], 1)
         self.assertEqual(detail["scoreboards"]["header_totals"]["blue"], 2)
@@ -268,6 +280,254 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(alice["advanced_stats"]["goals_2_guarded"], 1)
         self.assertEqual(alice["advanced_stats"]["avg_time_to_offense"], 1.75)
         self.assertEqual(alice["advanced_stats"]["shooting_percentage"], 50.0)
+        self.assertIn("g2 - 1", alice["advanced_stats"]["detail_tooltips"]["goals"])
+        self.assertIsNotNone(alice["advanced_stats"]["category_breakdown"]["shooting"]["overall_score"])
+        self.assertLess(alice["advanced_stats"]["category_breakdown"]["offense"]["overall_score"], 100.0)
+        self.assertLess(alice["advanced_stats"]["category_breakdown"]["passing"]["overall_score"], 100.0)
+
+    def test_match_detail_uses_raw_runtime_context_for_pass_and_save_breakdowns(self):
+        raw_log_path = self.raw_log_dir / "runtime_breakdown.jsonl"
+        snapshots = [
+            {
+                "sequence": 1,
+                "captured_at": "2026-01-01T00:00:00+00:00",
+                "source": "mock",
+                "snapshot": self._snapshot_frame("pre_match", 600, None, None),
+            },
+            {
+                "sequence": 2,
+                "captured_at": "2026-01-01T00:00:01+00:00",
+                "source": "mock",
+                "snapshot": self._snapshot_frame("playing", 599, "Alice", "blue"),
+            },
+            {
+                "sequence": 3,
+                "captured_at": "2026-01-01T00:00:02+00:00",
+                "source": "mock",
+                "snapshot": self._snapshot_frame("playing", 598, "Bob", "blue"),
+            },
+            {
+                "sequence": 4,
+                "captured_at": "2026-01-01T00:00:03+00:00",
+                "source": "mock",
+                "snapshot": self._snapshot_frame("playing", 597, "Charlie", "orange"),
+            },
+            {
+                "sequence": 5,
+                "captured_at": "2026-01-01T00:00:04+00:00",
+                "source": "mock",
+                "snapshot": self._snapshot_frame("playing", 596, "Alice", "blue"),
+            },
+            {
+                "sequence": 6,
+                "captured_at": "2026-01-01T00:00:05+00:00",
+                "source": "mock",
+                "snapshot": self._snapshot_frame("playing", 595, "Charlie", "orange"),
+            },
+            {
+                "sequence": 7,
+                "captured_at": "2026-01-01T00:00:06+00:00",
+                "source": "mock",
+                "snapshot": self._snapshot_frame("playing", 594, "Alice", "blue"),
+            },
+        ]
+        raw_log_path.write_text("\n".join(json.dumps(row) for row in snapshots) + "\n", encoding="utf-8")
+
+        connection = connect_database(self.database_path)
+        try:
+            with connection:
+                match_id = matches_repo.create_match(
+                    connection,
+                    display_name="Runtime Breakdown Match",
+                    started_at="2026-01-01T00:00:00+00:00",
+                    finalized=True,
+                    match_classification="Private",
+                    map_name="mpl_arena_a",
+                    blue_score=0,
+                    orange_score=0,
+                    raw_log_path=str(raw_log_path),
+                    total_rounds_played=1,
+                )
+                for alias, userid, team in (
+                    ("Alice", "1", "blue"),
+                    ("Bob", "2", "blue"),
+                    ("Charlie", "3", "orange"),
+                ):
+                    matches_repo.add_match_player(
+                        connection,
+                        match_id=match_id,
+                        match_alias=alias,
+                        userid=userid,
+                        team=team,
+                        confirmed=True,
+                    )
+                matches_repo.add_match_player_stat(
+                    connection,
+                    match_id=match_id,
+                    match_alias="Alice",
+                    userid="1",
+                    team="blue",
+                    stats={"saves": 1, "possession_time": 4.0},
+                )
+                matches_repo.add_match_player_stat(
+                    connection,
+                    match_id=match_id,
+                    match_alias="Bob",
+                    userid="2",
+                    team="blue",
+                    stats={"possession_time": 1.0},
+                )
+                matches_repo.add_match_player_stat(
+                    connection,
+                    match_id=match_id,
+                    match_alias="Charlie",
+                    userid="3",
+                    team="orange",
+                    stats={"shots_taken": 2, "possession_time": 2.0},
+                )
+                advanced_player_metrics_repo.add_metric_rows(
+                    connection,
+                    [
+                        {
+                            "match_id": match_id,
+                            "match_alias": "Alice",
+                            "userid": "1",
+                            "team": "blue",
+                            "completed_passes": 1,
+                            "metadata": {},
+                        }
+                    ],
+                )
+                for payload in (
+                    {
+                        "sequence": 4,
+                        "captured_at": "2026-01-01T00:00:03+00:00",
+                        "game_clock": 597.0,
+                        "game_clock_display": "09:57.00",
+                        "event_type": "shot",
+                        "actor_alias": "Charlie",
+                        "actor_userid": "3",
+                        "team": "orange",
+                    },
+                    {
+                        "sequence": 5,
+                        "captured_at": "2026-01-01T00:00:04+00:00",
+                        "game_clock": 596.0,
+                        "game_clock_display": "09:56.00",
+                        "event_type": "save",
+                        "actor_alias": "Alice",
+                        "actor_userid": "1",
+                        "team": "blue",
+                    },
+                    {
+                        "sequence": 6,
+                        "captured_at": "2026-01-01T00:00:05+00:00",
+                        "game_clock": 595.0,
+                        "game_clock_display": "09:55.00",
+                        "event_type": "shot",
+                        "actor_alias": "Charlie",
+                        "actor_userid": "3",
+                        "team": "orange",
+                    },
+                ):
+                    connection.execute(
+                        """
+                        INSERT INTO events (
+                            match_id, sequence, captured_at, game_clock, game_clock_display, event_type,
+                            actor_alias, actor_userid, team, metadata_json
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            match_id,
+                            payload["sequence"],
+                            payload["captured_at"],
+                            payload["game_clock"],
+                            payload["game_clock_display"],
+                            payload["event_type"],
+                            payload["actor_alias"],
+                            payload["actor_userid"],
+                            payload["team"],
+                            "{}",
+                        ),
+                    )
+        finally:
+            connection.close()
+
+        detail = MatchService(self.database_path).get_match_detail(match_id)
+        alice = detail["scoreboards"]["blue"][0]
+        self.assertIn("Bob - 1", alice["advanced_stats"]["detail_tooltips"]["passes"])
+        self.assertIn("Charlie - 1", alice["advanced_stats"]["detail_tooltips"]["saves"])
+
+    def _snapshot_frame(self, status: str, clock: float, possessor_alias: str | None, possessor_team: str | None) -> dict[str, object]:
+        def player(name: str, userid: str, playerid: str, body_x: float, team: str) -> dict[str, object]:
+            has_disc = possessor_alias == name and possessor_team == team
+            return {
+                "name": name,
+                "userid": userid,
+                "playerid": playerid,
+                "number": 0,
+                "level": 1,
+                "ping": 20,
+                "stats": {
+                    "possession_time": 0,
+                    "points": 0,
+                    "saves": 0,
+                    "goals": 0,
+                    "stuns": 0,
+                    "passes": 0,
+                    "catches": 0,
+                    "steals": 0,
+                    "blocks": 0,
+                    "interceptions": 0,
+                    "assists": 0,
+                    "shots_taken": 0,
+                },
+                "stunned": False,
+                "blocking": False,
+                "invulnerable": False,
+                "possession": has_disc,
+                "holding_left": "disc" if has_disc else "none",
+                "holding_right": "none",
+                "velocity": [0, 0, 0],
+                "head": {"position": [body_x, 1.6, 0]},
+                "body": {"position": [body_x, 0, 0]},
+                "lhand": {"pos": [body_x - 0.3, 0.4, 0]},
+                "rhand": {"pos": [body_x + 0.3, 0.4, 0]},
+            }
+
+        return {
+            "sessionid": "RUNTIME",
+            "sessionip": "127.0.0.1",
+            "game_status": status,
+            "game_clock": clock,
+            "game_clock_display": f"{int(clock // 60):02d}:{int(clock % 60):02d}.00",
+            "match_type": "Echo_Arena_Private",
+            "map_name": "mpl_arena_a",
+            "client_name": "Alice",
+            "blue_points": 0,
+            "orange_points": 0,
+            "disc": {"position": [-34 if possessor_team == "blue" else 34 if possessor_team == "orange" else 0, 0, 0]},
+            "possession": [0, 0] if possessor_team == "blue" else [1, 0] if possessor_team == "orange" else [-1, -1],
+            "last_score": {"person_scored": "[INVALID]", "assist_scored": "[INVALID]", "team": "blue", "point_amount": 0},
+            "teams": [
+                {
+                    "team": "BLUE TEAM",
+                    "possession": possessor_team == "blue",
+                    "players": [
+                        player("Alice", "1", "0", -35.0, "blue"),
+                        player("Bob", "2", "1", -12.0, "blue"),
+                    ],
+                },
+                {
+                    "team": "ORANGE TEAM",
+                    "possession": possessor_team == "orange",
+                    "players": [
+                        player("Charlie", "3", "2", 28.0, "orange"),
+                    ],
+                },
+            ],
+        }
 
     def test_advanced_summary_service_uses_toggleable_confidence_levels(self):
         profile_service = ProfileService(self.database_path)
@@ -435,6 +695,8 @@ class ServiceTests(unittest.TestCase):
         shooting = medium_high["category_breakdown"]["shooting"]
         self.assertIsNotNone(shooting["overall_score"])
         self.assertGreater(float(shooting["overall_score"]), 0.0)
+        self.assertIn("display_score", shooting)
+        self.assertIn("absolute_score", shooting)
         shooting_metrics = {row["label"]: row["value"] for row in shooting["metrics"]}
         self.assertEqual(shooting_metrics["Guarded 2s"], "2")
         self.assertEqual(shooting_metrics["Open 3s"], "1")
@@ -479,6 +741,312 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(all_levels["event_counts"]["turnover"], 2)
         self.assertEqual(all_levels["event_averages_per_round"]["turnover"], 1.333)
         self.assertEqual(all_levels["transitions"]["average_time_to_defense"], 4.0)
+        self.assertEqual(shooting["category_name"], "Shooting")
+        self.assertIn("base_score", shooting)
+        self.assertIn("mistake_penalty", shooting)
+        self.assertIn("mistake_adjusted_score", shooting)
+        self.assertIn("sample_confidence", shooting)
+        self.assertIn("confidence_label", shooting)
+        self.assertIn("display_overall_score", medium_high)
+        self.assertIn("absolute_overall_score", medium_high)
+
+        production_only = service.local_user_summary(
+            confidence_levels=["high", "medium"],
+            filters=StatsFilter(category_scoring_mode="production_only"),
+        )
+        self.assertGreater(
+            float(production_only["category_breakdown"]["shooting"]["final_score"]),
+            float(medium_high["category_breakdown"]["shooting"]["final_score"]),
+        )
+
+    def test_phase11_curve_and_confidence_helpers(self):
+        self.assertAlmostEqual(_elite_curve_score("shooting", 2.75), 55.0, delta=0.1)
+        self.assertAlmostEqual(_elite_curve_score("shooting", 8.02), 100.0, delta=0.1)
+        self.assertLessEqual(float(_elite_curve_score("shooting", 999.0) or 0.0), 110.0)
+        self.assertAlmostEqual(_sample_confidence(2.5), math.sqrt(0.25), places=6)
+        self.assertEqual(_confidence_label(2.9), "very low sample")
+        self.assertEqual(_confidence_label(3.0), "low sample")
+        self.assertEqual(_confidence_label(5.0), "medium sample")
+        self.assertEqual(_confidence_label(10.0), "stable sample")
+        self.assertAlmostEqual(float(_relative_percentile(20.0, [10.0, 20.0, 30.0]) or 0.0), 50.0, delta=0.1)
+        self.assertIsNone(_relative_percentile(20.0, [20.0]))
+
+    def test_phase11_category_score_entry_supports_modes_and_penalties(self):
+        mistake_adjusted = _category_score_entry(
+            "shooting",
+            "Shooting",
+            raw_value=8.02,
+            rounds=1.0,
+            scoring_mode="mistake_adjusted",
+            score_note="Test",
+            metrics=[],
+            positive_inputs=[("Guarded 3s", 4.0), ("Open 3s", 2.0)],
+            mistake_inputs=[("Missed shots", 8.0), ("Shots saved", 3.0), ("Stuffed shots", 4.5)],
+            mistake_cap=35.0,
+        )
+        production_only = _category_score_entry(
+            "shooting",
+            "Shooting",
+            raw_value=8.02,
+            rounds=1.0,
+            scoring_mode="production_only",
+            score_note="Test",
+            metrics=[],
+            positive_inputs=[("Guarded 3s", 4.0), ("Open 3s", 2.0)],
+            mistake_inputs=[("Missed shots", 8.0), ("Shots saved", 3.0), ("Stuffed shots", 4.5)],
+            mistake_cap=35.0,
+        )
+        no_mistakes = _category_score_entry(
+            "speed",
+            "Speed",
+            raw_value=137.30,
+            rounds=8.0,
+            scoring_mode="mistake_adjusted",
+            score_note="Test",
+            metrics=[],
+            positive_inputs=[],
+            mistake_inputs=[("Missing metric", 0.0)],
+            mistake_cap=25.0,
+        )
+
+        self.assertEqual(mistake_adjusted["base_score"], 100.0)
+        self.assertEqual(mistake_adjusted["mistake_penalty"], 15.5)
+        self.assertEqual(mistake_adjusted["mistake_adjusted_score"], 84.5)
+        self.assertLess(float(mistake_adjusted["final_score"] or 0.0), 84.5)
+        self.assertEqual(mistake_adjusted["confidence_label"], "very low sample")
+        self.assertGreater(float(production_only["final_score"] or 0.0), float(mistake_adjusted["final_score"] or 0.0))
+        self.assertEqual(no_mistakes["mistake_penalty"], 0.0)
+        self.assertIn("Main positives", {row["label"] for row in mistake_adjusted["metrics"]})
+        self.assertIn("Main issues", {row["label"] for row in mistake_adjusted["metrics"]})
+
+    def test_phase11_hybrid_display_scores_add_relative_layer(self):
+        payload = apply_hybrid_display_scores(
+            {
+                "shooting": {"overall_score": 46.4},
+                "speed": {"overall_score": 40.5},
+            },
+            [
+                {"shooting": {"overall_score": 46.4}, "speed": {"overall_score": 40.5}},
+                {"shooting": {"overall_score": 38.0}, "speed": {"overall_score": 36.9}},
+                {"shooting": {"overall_score": 35.3}, "speed": {"overall_score": 32.9}},
+            ],
+            context_label="this match",
+        )
+
+        shooting = payload["category_breakdown"]["shooting"]
+        speed = payload["category_breakdown"]["speed"]
+        self.assertEqual(shooting["display_context"], "this match")
+        self.assertEqual(shooting["display_reference_count"], 3)
+        self.assertGreater(float(shooting["display_score"] or 0.0), float(shooting["absolute_score"] or 0.0))
+        self.assertGreaterEqual(float(speed["display_percentile"] or 0.0), 0.0)
+        self.assertIsNotNone(payload["display_overall_score"])
+
+    def test_phase11_active_round_estimate_excludes_long_inactive_gaps(self):
+        accumulator = PlayerMetricAccumulator(
+            match_id=1,
+            player_id=1,
+            match_alias="Alice",
+            userid="u1",
+            team="blue",
+        )
+        frames = [
+            SnapshotFrame(
+                sequence=1,
+                captured_at="2026-06-09T00:00:00+00:00",
+                game_clock=10.0,
+                game_clock_display="00:10",
+                game_status="playing",
+                blue_score=0,
+                orange_score=0,
+                disc=DiscState(),
+                players=[
+                    PlayerState(
+                        alias="Alice",
+                        userid="u1",
+                        playerid="0",
+                        team="blue",
+                        body_position=(0.0, 0.0, 0.0),
+                        velocity=(0.0, 0.0, 0.0),
+                        stats={},
+                    )
+                ],
+            ),
+            SnapshotFrame(
+                sequence=2,
+                captured_at="2026-06-09T00:00:01+00:00",
+                game_clock=9.0,
+                game_clock_display="00:09",
+                game_status="playing",
+                blue_score=0,
+                orange_score=0,
+                disc=DiscState(),
+                players=[
+                    PlayerState(
+                        alias="Alice",
+                        userid="u1",
+                        playerid="0",
+                        team="blue",
+                        body_position=(1.0, 0.0, 0.0),
+                        velocity=(1.0, 0.0, 0.0),
+                        stats={},
+                    )
+                ],
+            ),
+            SnapshotFrame(
+                sequence=3,
+                captured_at="2026-06-09T00:00:02+00:00",
+                game_clock=8.0,
+                game_clock_display="00:08",
+                game_status="playing",
+                blue_score=0,
+                orange_score=0,
+                disc=DiscState(),
+                players=[
+                    PlayerState(
+                        alias="Alice",
+                        userid="u1",
+                        playerid="0",
+                        team="blue",
+                        body_position=(2.0, 0.0, 0.0),
+                        velocity=(1.0, 0.0, 0.0),
+                        stats={},
+                    )
+                ],
+            ),
+            SnapshotFrame(
+                sequence=4,
+                captured_at="2026-06-09T00:00:03+00:00",
+                game_clock=7.0,
+                game_clock_display="00:07",
+                game_status="playing",
+                blue_score=0,
+                orange_score=0,
+                disc=DiscState(),
+                players=[
+                    PlayerState(
+                        alias="Alice",
+                        userid="u1",
+                        playerid="0",
+                        team="blue",
+                        body_position=(2.0, 0.0, 0.0),
+                        velocity=(0.0, 0.0, 0.0),
+                        stats={},
+                    )
+                ],
+            ),
+            SnapshotFrame(
+                sequence=5,
+                captured_at="2026-06-09T00:00:04+00:00",
+                game_clock=6.0,
+                game_clock_display="00:06",
+                game_status="playing",
+                blue_score=0,
+                orange_score=0,
+                disc=DiscState(),
+                players=[
+                    PlayerState(
+                        alias="Alice",
+                        userid="u1",
+                        playerid="0",
+                        team="blue",
+                        body_position=(2.0, 0.0, 0.0),
+                        velocity=(0.0, 0.0, 0.0),
+                        stats={},
+                    )
+                ],
+            ),
+            SnapshotFrame(
+                sequence=6,
+                captured_at="2026-06-09T00:00:05+00:00",
+                game_clock=5.0,
+                game_clock_display="00:05",
+                game_status="playing",
+                blue_score=0,
+                orange_score=0,
+                disc=DiscState(),
+                players=[
+                    PlayerState(
+                        alias="Alice",
+                        userid="u1",
+                        playerid="0",
+                        team="blue",
+                        body_position=(2.0, 0.0, 0.0),
+                        velocity=(0.0, 0.0, 0.0),
+                        stats={},
+                    )
+                ],
+            ),
+            SnapshotFrame(
+                sequence=7,
+                captured_at="2026-06-09T00:00:06+00:00",
+                game_clock=4.0,
+                game_clock_display="00:04",
+                game_status="playing",
+                blue_score=0,
+                orange_score=0,
+                disc=DiscState(),
+                players=[
+                    PlayerState(
+                        alias="Alice",
+                        userid="u1",
+                        playerid="0",
+                        team="blue",
+                        body_position=(2.0, 0.0, 0.0),
+                        velocity=(0.0, 0.0, 0.0),
+                        stats={},
+                    )
+                ],
+            ),
+            SnapshotFrame(
+                sequence=8,
+                captured_at="2026-06-09T00:00:07+00:00",
+                game_clock=3.0,
+                game_clock_display="00:03",
+                game_status="playing",
+                blue_score=0,
+                orange_score=0,
+                disc=DiscState(),
+                players=[
+                    PlayerState(
+                        alias="Alice",
+                        userid="u1",
+                        playerid="0",
+                        team="blue",
+                        body_position=(2.0, 0.0, 0.0),
+                        velocity=(0.0, 0.0, 0.0),
+                        stats={},
+                    )
+                ],
+            ),
+            SnapshotFrame(
+                sequence=9,
+                captured_at="2026-06-09T00:00:08+00:00",
+                game_clock=2.0,
+                game_clock_display="00:02",
+                game_status="playing",
+                blue_score=0,
+                orange_score=0,
+                disc=DiscState(),
+                players=[
+                    PlayerState(
+                        alias="Alice",
+                        userid="u1",
+                        playerid="0",
+                        team="blue",
+                        body_position=(3.0, 0.0, 0.0),
+                        velocity=(1.0, 0.0, 0.0),
+                        stats={},
+                    )
+                ],
+            ),
+        ]
+
+        accumulators = {"blue::alice": accumulator}
+        _apply_active_round_estimates(accumulators, 1, frames, "Private")
+
+        self.assertAlmostEqual(accumulator.active_clock_seconds, 3.0, places=3)
+        self.assertAlmostEqual(float(accumulator.metadata.get("inactive_seconds_observed") or 0.0), 5.0, places=3)
+        self.assertGreater(float(accumulator.metadata.get("movement_distance_observed") or 0.0), 0.0)
 
     def test_player_comparison_service_compares_two_players_across_shared_matches(self):
         connection = connect_database(self.database_path)

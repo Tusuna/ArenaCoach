@@ -2,17 +2,32 @@
 
 from __future__ import annotations
 
+from bisect import bisect_left, bisect_right
 from collections import Counter
 from contextlib import contextmanager
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 import json
+import math
 from pathlib import Path
 import statistics
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Mapping, Optional
 
 from arena_coach.database import connect_database
 from arena_coach.inference import AdvancedInferenceService
 from arena_coach.repositories import players_repo, profiles_repo
+
+
+CATEGORY_SCORE_ANCHORS = {
+    "shooting": {"anchor_50": 2.75, "anchor_100": 8.02},
+    "speed": {"anchor_50": 137.30, "anchor_100": 188.60},
+    "possession": {"anchor_50": 7.78, "anchor_100": 26.64},
+    "offense": {"anchor_50": 12.04, "anchor_100": 24.15},
+    "defense": {"anchor_50": 8.92, "anchor_100": 31.32},
+    "passing": {"anchor_50": 14.78, "anchor_100": 34.77},
+}
+
+DISPLAY_SCORE_ABSOLUTE_WEIGHT = 0.35
+DISPLAY_CATEGORY_ORDER = ("shooting", "speed", "possession", "offense", "defense", "passing")
 
 
 class AdvancedAnalysisService:
@@ -118,11 +133,20 @@ class AdvancedAnalysisService:
             include_low_confidence=include_low_confidence,
         )
 
-    def player_metric_summary(self, player_id: int, filters: Optional["StatsFilter"] = None) -> dict[str, Any]:
+    def player_metric_summary(
+        self,
+        player_id: int,
+        filters: Optional["StatsFilter"] = None,
+        *,
+        scoring_mode: Optional[str] = None,
+    ) -> dict[str, Any]:
         from arena_coach.services.stats_service import DatabaseStatsService
         from arena_coach.stats.stat_filters import StatsFilter
 
         active_filters = filters or StatsFilter()
+        resolved_scoring_mode = _normalize_category_scoring_mode(
+            scoring_mode or getattr(active_filters, "category_scoring_mode", None)
+        )
         engine = DatabaseStatsService(self.database_path)._engine()
         filtered_matches = engine._apply_match_filters(engine.matches, active_filters)
         allowed_match_ids = [int(match.id) for match in filtered_matches]
@@ -148,6 +172,7 @@ class AdvancedAnalysisService:
                     "match_count": 0,
                     "metric_rounds_considered": 0,
                     "category_breakdown": {},
+                    "category_scoring_mode": resolved_scoring_mode,
                     "warnings": ["No matches matched the current filters."],
                     "competitive_baseline_sample_size": 0,
                     "competitive_baseline_match_ids": [],
@@ -271,7 +296,21 @@ class AdvancedAnalysisService:
 
         aggregate = _aggregate_local_metric_rows(metric_rows, stat_rows)
         baselines = _competitive_category_baselines(baseline_rows)
-        category_breakdown = _build_category_breakdown(aggregate, baselines=baselines) if metric_rows else {}
+        category_breakdown = (
+            _build_category_breakdown(aggregate, baselines=baselines, scoring_mode=resolved_scoring_mode)
+            if metric_rows
+            else {}
+        )
+        reference_breakdowns = build_reference_category_breakdowns(
+            baseline_rows,
+            baselines=baselines,
+            scoring_mode=resolved_scoring_mode,
+        )
+        display_payload = apply_hybrid_display_scores(
+            category_breakdown,
+            reference_breakdowns,
+            context_label="competitive player-team rows from your reviewed matches",
+        )
         warnings: list[str] = []
         if not metric_rows:
             warnings.append("No advanced player metrics are available for this player in the current filters yet.")
@@ -282,7 +321,15 @@ class AdvancedAnalysisService:
             "match_ids": sorted({int(row["match_id"]) for row in metric_rows or stat_rows}, reverse=True),
             "match_count": len({int(row["match_id"]) for row in metric_rows or stat_rows}),
             "metric_rounds_considered": aggregate["rounds"],
-            "category_breakdown": category_breakdown,
+            "category_breakdown": display_payload["category_breakdown"],
+            "category_scoring_mode": resolved_scoring_mode,
+            "absolute_overall_score": display_payload["absolute_overall_score"],
+            "display_overall_score": display_payload["display_overall_score"],
+            "display_percentile": display_payload["display_percentile"],
+            "display_context": display_payload["display_context"],
+            "display_reference_count": display_payload["display_reference_count"],
+            "display_absolute_weight": display_payload["display_absolute_weight"],
+            "display_percentile_weight": display_payload["display_percentile_weight"],
             "warnings": warnings,
             "competitive_baseline_sample_size": len(baseline_rows),
             "competitive_baseline_match_ids": sorted({int(row["match_id"]) for row in baseline_rows}),
@@ -293,12 +340,16 @@ class AdvancedAnalysisService:
         *,
         confidence_levels: Optional[Iterable[str]] = None,
         filters: Optional["StatsFilter"] = None,
+        scoring_mode: Optional[str] = None,
     ) -> dict[str, Any]:
         from arena_coach.services.stats_service import DatabaseStatsService
         from arena_coach.stats.stat_filters import StatsFilter
 
         selected_levels = _normalized_confidence_levels(confidence_levels)
         active_filters = filters or StatsFilter()
+        resolved_scoring_mode = _normalize_category_scoring_mode(
+            scoring_mode or getattr(active_filters, "category_scoring_mode", None)
+        )
         engine = DatabaseStatsService(self.database_path)._engine()
         with _connection(self.database_path) as connection:
             active = profiles_repo.get_active_profile(connection)
@@ -306,6 +357,7 @@ class AdvancedAnalysisService:
                 return {
                     "active_profile": None,
                     "confidence_levels": selected_levels,
+                    "category_scoring_mode": resolved_scoring_mode,
                     "warnings": ["No active profile. Create or select one first."],
                     "event_counts": {},
                     "confidence_counts": {},
@@ -363,6 +415,7 @@ class AdvancedAnalysisService:
                         "primary_echo_name": active["primary_echo_name"],
                     },
                     "confidence_levels": selected_levels,
+                    "category_scoring_mode": resolved_scoring_mode,
                     "warnings": ["No finalized self-mapped canonical player was found for the active profile yet."],
                     "event_counts": {},
                     "confidence_counts": {},
@@ -380,6 +433,7 @@ class AdvancedAnalysisService:
                         "primary_echo_name": active["primary_echo_name"],
                     },
                     "confidence_levels": selected_levels,
+                    "category_scoring_mode": resolved_scoring_mode,
                     "warnings": ["No finalized self matches matched the current filters."],
                     "canonical_player_names": player_names,
                     "event_counts": {},
@@ -526,7 +580,21 @@ class AdvancedAnalysisService:
         }
         competitive_sample_rows = [row for row in competitive_sample_rows if not _row_afk_suspected(row)]
         competitive_baselines = _competitive_category_baselines(competitive_sample_rows)
-        category_breakdown = _build_category_breakdown(metric_aggregate, baselines=competitive_baselines)
+        category_breakdown = _build_category_breakdown(
+            metric_aggregate,
+            baselines=competitive_baselines,
+            scoring_mode=resolved_scoring_mode,
+        )
+        reference_breakdowns = build_reference_category_breakdowns(
+            competitive_sample_rows,
+            baselines=competitive_baselines,
+            scoring_mode=resolved_scoring_mode,
+        )
+        display_payload = apply_hybrid_display_scores(
+            category_breakdown,
+            reference_breakdowns,
+            context_label="competitive player-team rows from your reviewed matches",
+        )
 
         warnings: list[str] = []
         if len(player_ids) > 1:
@@ -558,10 +626,168 @@ class AdvancedAnalysisService:
             "total_advanced_events": len(filtered_rows),
             "total_rounds_considered": event_rounds_considered,
             "metric_rounds_considered": metric_aggregate["rounds"],
-            "category_breakdown": category_breakdown,
+            "category_breakdown": display_payload["category_breakdown"],
+            "category_scoring_mode": resolved_scoring_mode,
+            "absolute_overall_score": display_payload["absolute_overall_score"],
+            "display_overall_score": display_payload["display_overall_score"],
+            "display_percentile": display_payload["display_percentile"],
+            "display_context": display_payload["display_context"],
+            "display_reference_count": display_payload["display_reference_count"],
+            "display_absolute_weight": display_payload["display_absolute_weight"],
+            "display_percentile_weight": display_payload["display_percentile_weight"],
             "metric_summary_note": "Category cards use estimated personal active rounds from stored per-match player metrics. Confidence toggles still affect event views only.",
             "competitive_baseline_sample_size": len(competitive_sample_rows),
             "competitive_baseline_match_ids": sorted({int(row["match_id"]) for row in competitive_sample_rows}),
+        }
+
+    def export_metric_tuning_report(
+        self,
+        filters: Optional["StatsFilter"] = None,
+        *,
+        scoring_mode: Optional[str] = None,
+    ) -> dict[str, Any]:
+        from arena_coach.services.stats_service import DatabaseStatsService
+        from arena_coach.stats.stat_filters import StatsFilter
+
+        active_filters = filters or StatsFilter(
+            competitive_only=True,
+            include_low_quality=False,
+            include_public=True,
+            include_private=True,
+            include_tournament=True,
+            include_unknown=False,
+            include_afk_players=False,
+            include_guest_players=False,
+            private_match_types=("PUG", "Official"),
+        )
+        resolved_scoring_mode = _normalize_category_scoring_mode(
+            scoring_mode or getattr(active_filters, "category_scoring_mode", None)
+        )
+        export_filters = active_filters.with_updates(category_scoring_mode=resolved_scoring_mode)
+        stats_service = DatabaseStatsService(self.database_path)
+
+        with _connection(self.database_path) as connection:
+            active_profile = profiles_repo.get_active_profile(connection)
+            player_rows = list(
+                connection.execute(
+                    """
+                    SELECT id, canonical_name, created_at
+                    FROM players
+                    ORDER BY lower(canonical_name), id
+                    """
+                )
+            )
+
+        players: list[dict[str, Any]] = []
+        for row in player_rows:
+            player_id = int(row["id"])
+            stats_summary = stats_service.player(player_id, export_filters)
+            advanced_summary = self.player_metric_summary(
+                player_id,
+                export_filters,
+                scoring_mode=resolved_scoring_mode,
+            )
+            if int(stats_summary.get("matches", 0)) <= 0 and float(advanced_summary.get("metric_rounds_considered", 0.0)) <= 0.0:
+                continue
+
+            categories = {}
+            for category_key, category in (advanced_summary.get("category_breakdown") or {}).items():
+                if not isinstance(category, dict):
+                    continue
+                categories[str(category_key)] = {
+                    "final_score": category.get("final_score"),
+                    "display_score": category.get("display_score"),
+                    "display_percentile": category.get("display_percentile"),
+                    "base_score": category.get("base_score"),
+                    "mistake_penalty": category.get("mistake_penalty"),
+                    "mistake_adjusted_score": category.get("mistake_adjusted_score"),
+                    "sample_confidence": category.get("sample_confidence"),
+                    "confidence_label": category.get("confidence_label"),
+                    "raw_value": category.get("raw_value"),
+                    "main_positive_inputs": list(category.get("main_positive_inputs") or []),
+                    "main_mistake_inputs": list(category.get("main_mistake_inputs") or []),
+                    "explanation": category.get("explanation"),
+                }
+
+            players.append(
+                {
+                    "player_id": player_id,
+                    "canonical_name": row["canonical_name"],
+                    "created_at": row["created_at"],
+                    "matches": stats_summary.get("matches", 0),
+                    "absolute_overall_score": advanced_summary.get("absolute_overall_score"),
+                    "display_overall_score": advanced_summary.get("display_overall_score"),
+                    "display_percentile": advanced_summary.get("display_percentile"),
+                    "record": {
+                        "wins": stats_summary.get("wins", 0),
+                        "losses": stats_summary.get("losses", 0),
+                        "ties": stats_summary.get("ties", 0),
+                        "win_rate": stats_summary.get("win_rate", 0.0),
+                    },
+                    "shot_efficiency": stats_summary.get("shot_efficiency", 0.0),
+                    "totals": stats_summary.get("totals") or {},
+                    "averages": stats_summary.get("averages") or {},
+                    "advanced_rounds_considered": advanced_summary.get("metric_rounds_considered", 0.0),
+                    "advanced_match_count": advanced_summary.get("match_count", 0),
+                    "advanced_categories": categories,
+                    "advanced_warnings": list(advanced_summary.get("warnings") or []),
+                }
+            )
+
+        category_averages: dict[str, dict[str, Any]] = {}
+        for category_key in ("shooting", "speed", "possession", "offense", "defense", "passing"):
+            category_rows = [player["advanced_categories"].get(category_key) for player in players if player["advanced_categories"].get(category_key)]
+            if not category_rows:
+                continue
+            category_averages[category_key] = {
+                "player_count": len(category_rows),
+                "average_final_score": _mean_optional(row.get("final_score") for row in category_rows),
+                "average_base_score": _mean_optional(row.get("base_score") for row in category_rows),
+                "average_mistake_penalty": _mean_optional(row.get("mistake_penalty") for row in category_rows),
+                "average_raw_value": _mean_optional(row.get("raw_value") for row in category_rows),
+                "average_sample_confidence": _mean_optional(row.get("sample_confidence") for row in category_rows),
+                "top_positive_inputs": _most_common_strings(
+                    entry
+                    for row in category_rows
+                    for entry in list(row.get("main_positive_inputs") or [])
+                ),
+                "top_mistake_inputs": _most_common_strings(
+                    entry
+                    for row in category_rows
+                    for entry in list(row.get("main_mistake_inputs") or [])
+                ),
+            }
+
+        player_match_counts = [int(player.get("matches", 0)) for player in players]
+        player_round_counts = [float(player.get("advanced_rounds_considered", 0.0)) for player in players]
+        return {
+            "generated_at": datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+            "database_path": str(self.database_path),
+            "active_profile": {
+                "id": int(active_profile["id"]) if active_profile is not None else None,
+                "display_name": active_profile["display_name"] if active_profile is not None else None,
+                "primary_echo_name": active_profile["primary_echo_name"] if active_profile is not None else None,
+            },
+            "filters": {
+                "competitive_only": export_filters.competitive_only,
+                "include_low_quality": export_filters.include_low_quality,
+                "include_public": export_filters.include_public,
+                "include_private": export_filters.include_private,
+                "include_tournament": export_filters.include_tournament,
+                "include_unknown": export_filters.include_unknown,
+                "include_afk_players": export_filters.include_afk_players,
+                "include_guest_players": export_filters.include_guest_players,
+                "private_match_types": list(export_filters.selected_private_match_types()),
+                "from_date": export_filters.from_date.isoformat() if export_filters.from_date else None,
+                "to_date": export_filters.to_date.isoformat() if export_filters.to_date else None,
+                "last_n": export_filters.last_n,
+                "category_scoring_mode": resolved_scoring_mode,
+            },
+            "player_count": len(players),
+            "player_match_average": round(statistics.mean(player_match_counts), 3) if player_match_counts else 0.0,
+            "player_advanced_round_average": round(statistics.mean(player_round_counts), 3) if player_round_counts else 0.0,
+            "category_averages": category_averages,
+            "players": players,
         }
 
 
@@ -780,6 +1006,179 @@ def _aggregate_local_metric_rows(metric_rows: list[Any], stat_rows: list[Any]) -
     }
 
 
+def build_match_only_category_breakdown(
+    metric_row: Optional[dict[str, Any]],
+    stat_row: Optional[dict[str, Any]],
+    *,
+    total_rounds: Optional[float] = None,
+    baselines: Optional[dict[str, dict[str, Any]]] = None,
+    scoring_mode: str = "mistake_adjusted",
+) -> dict[str, Any]:
+    if not metric_row and not stat_row:
+        return {}
+
+    metric_payload = dict(metric_row or {})
+    stat_payload = dict(stat_row or {})
+    if metric_payload and "metadata_json" not in metric_payload:
+        metric_payload["metadata_json"] = json.dumps(metric_payload.get("metadata") or {})
+    if stat_payload and "metadata_json" not in stat_payload:
+        stat_payload["metadata_json"] = json.dumps(stat_payload.get("metadata") or {})
+    if total_rounds is not None:
+        if metric_payload:
+            metric_payload.setdefault("total_rounds_played", total_rounds)
+        if stat_payload:
+            stat_payload.setdefault("total_rounds_played", total_rounds)
+
+    totals = Counter()
+    metadata_totals = Counter()
+    stat_totals = Counter()
+
+    if metric_payload:
+        _merge_metric_row_into_totals(metric_payload, totals, metadata_totals)
+    if stat_payload:
+        _merge_stat_row_into_totals(stat_payload, stat_totals)
+
+    rounds = 0.0
+    for row in (metric_payload, stat_payload):
+        if not row:
+            continue
+        rounds = max(rounds, _row_active_rounds_estimate(row, fallback_to_total_rounds=True))
+    if rounds <= 0.0 and total_rounds is not None:
+        rounds = float(_round_count(total_rounds))
+    if rounds <= 0.0:
+        rounds = 1.0
+
+    goals_2_open = _safe_number(totals["goals_2_open_net"])
+    goals_2_guarded = _safe_number(totals["goals_2_guarded"])
+    goals_3_open = _safe_number(totals["goals_3_open_net"])
+    goals_3_guarded = _safe_number(totals["goals_3_guarded"])
+    goals_total = int(goals_2_open + goals_2_guarded + goals_3_open + goals_3_guarded)
+    raw_goal_points_total = int((goals_2_open * 2.0) + (goals_2_guarded * 2.0) + (goals_3_open * 3.0) + (goals_3_guarded * 3.0))
+    failed_shots_total = int(totals["missed_shots"]) + int(totals["shots_saved_against"])
+    shooting_percentage = (
+        round((float(goals_total) / float(failed_shots_total)) * 100.0, 2)
+        if failed_shots_total > 0
+        else None
+    )
+    bounded_conversion = (
+        round((float(goals_total) / float(goals_total + failed_shots_total)) * 100.0, 2)
+        if (goals_total + failed_shots_total) > 0
+        else None
+    )
+
+    return _build_category_breakdown(
+        {
+            "rounds": float(rounds),
+            "metric_totals": dict(totals),
+            "stat_totals": dict(stat_totals),
+            "metadata_totals": dict(metadata_totals),
+            "goals_total": goals_total,
+            "raw_goal_points_total": raw_goal_points_total,
+            "failed_shots_total": failed_shots_total,
+            "shooting_percentage": shooting_percentage,
+            "bounded_conversion": bounded_conversion,
+        },
+        baselines=baselines,
+        scoring_mode=scoring_mode,
+    )
+
+
+def build_reference_category_breakdowns(
+    rows: Iterable[Any],
+    *,
+    baselines: Optional[dict[str, dict[str, Any]]] = None,
+    scoring_mode: str = "mistake_adjusted",
+) -> list[dict[str, Any]]:
+    reference_breakdowns: list[dict[str, Any]] = []
+    for row in rows:
+        aggregate = _aggregate_competitive_sample_row(row)
+        breakdown = _build_category_breakdown(
+            aggregate,
+            baselines=baselines,
+            scoring_mode=scoring_mode,
+        )
+        if breakdown:
+            reference_breakdowns.append(breakdown)
+    return reference_breakdowns
+
+
+def apply_hybrid_display_scores(
+    category_breakdown: dict[str, Any],
+    reference_breakdowns: Iterable[dict[str, Any]],
+    *,
+    context_label: str,
+    absolute_weight: float = DISPLAY_SCORE_ABSOLUTE_WEIGHT,
+) -> dict[str, Any]:
+    updated_breakdown: dict[str, Any] = {}
+    reference_list = [reference for reference in reference_breakdowns if isinstance(reference, dict)]
+    reference_category_values = {
+        key: _reference_category_scores(reference_list, key)
+        for key in DISPLAY_CATEGORY_ORDER
+    }
+    reference_overall_values = _reference_overall_scores(reference_list)
+
+    for key, detail in category_breakdown.items():
+        if not isinstance(detail, dict):
+            updated_breakdown[str(key)] = detail
+            continue
+        absolute_score = _extract_category_absolute_score(detail)
+        display_percentile = _relative_percentile(absolute_score, reference_category_values.get(str(key), []))
+        display_score = _hybrid_display_score(absolute_score, display_percentile, absolute_weight)
+        enriched = dict(detail)
+        enriched["absolute_score"] = _rounded_optional(absolute_score, decimals=1)
+        enriched["display_score"] = _rounded_optional(display_score, decimals=1)
+        enriched["display_percentile"] = _rounded_optional(display_percentile, decimals=1)
+        enriched["display_context"] = context_label
+        enriched["display_reference_count"] = len(reference_category_values.get(str(key), []))
+        updated_breakdown[str(key)] = enriched
+
+    absolute_overall_score = _breakdown_overall_score(updated_breakdown, score_key="absolute_score")
+    display_percentile = _relative_percentile(absolute_overall_score, reference_overall_values)
+    display_overall_score = _hybrid_display_score(absolute_overall_score, display_percentile, absolute_weight)
+    return {
+        "category_breakdown": updated_breakdown,
+        "absolute_overall_score": _rounded_optional(absolute_overall_score, decimals=1),
+        "display_overall_score": _rounded_optional(display_overall_score, decimals=1),
+        "display_percentile": _rounded_optional(display_percentile, decimals=1),
+        "display_context": context_label,
+        "display_reference_count": len(reference_overall_values),
+        "display_absolute_weight": round(float(absolute_weight), 3),
+        "display_percentile_weight": round(1.0 - float(absolute_weight), 3),
+    }
+
+
+def competitive_category_baselines_for_database(database_path: Path) -> dict[str, dict[str, Any]]:
+    with _connection(database_path) as connection:
+        rows = list(
+            connection.execute(
+                """
+                SELECT
+                    apm.*,
+                    m.match_classification,
+                    m.private_match_type,
+                    m.finalized
+                FROM advanced_player_metrics apm
+                INNER JOIN matches m ON m.id = apm.match_id
+                WHERE m.finalized = 1
+                """
+            )
+        )
+    competitive_rows = []
+    for row in rows:
+        classification = str(row["match_classification"] or "").strip().casefold()
+        private_type = str(row["private_match_type"] or "").strip().casefold()
+        if classification == "public":
+            eligible = True
+        elif classification == "private":
+            eligible = private_type in {"pug", "official"}
+        else:
+            eligible = False
+        if not eligible or _row_afk_suspected(row):
+            continue
+        competitive_rows.append(row)
+    return _competitive_category_baselines(competitive_rows)
+
+
 def _aggregate_competitive_sample_row(row: Any) -> dict[str, Any]:
     totals = Counter()
     stat_totals = Counter()
@@ -818,11 +1217,17 @@ def _aggregate_competitive_sample_row(row: Any) -> dict[str, Any]:
     }
 
 
-def _build_category_breakdown(aggregate: dict[str, Any], baselines: Optional[dict[str, dict[str, Any]]] = None) -> dict[str, Any]:
+def _build_category_breakdown(
+    aggregate: dict[str, Any],
+    baselines: Optional[dict[str, dict[str, Any]]] = None,
+    *,
+    scoring_mode: str = "mistake_adjusted",
+) -> dict[str, Any]:
     rounds = float(aggregate.get("rounds") or 0.0)
     totals = aggregate.get("metric_totals") or {}
     stat_totals = aggregate.get("stat_totals") or {}
     metadata_totals = aggregate.get("metadata_totals") or {}
+    scoring_mode = _normalize_category_scoring_mode(scoring_mode)
 
     goals_2_guarded = _safe_number(totals.get("goals_2_guarded"))
     goals_3_guarded = _safe_number(totals.get("goals_3_guarded"))
@@ -832,8 +1237,9 @@ def _build_category_breakdown(aggregate: dict[str, Any], baselines: Optional[dic
     shots_saved = _safe_number(totals.get("shots_saved_against"))
     dunk_like_open_2s = _safe_number(metadata_totals.get("dunk_like_open_2s"))
     dunk_like_guarded_2s = _safe_number(metadata_totals.get("dunk_like_guarded_2s"))
+    self_goals = _safe_number(metadata_totals.get("self_goals"))
+    shooter_uncovered = _safe_number(metadata_totals.get("shooter_uncovered"))
     shooting_percentage = aggregate.get("shooting_percentage")
-    bounded_conversion = aggregate.get("bounded_conversion")
     adjusted_guarded_2_for_bonus = max(0.0, goals_2_guarded - dunk_like_guarded_2s)
     actual_scoreboard_points = _safe_number(stat_totals.get("points"))
     raw_goal_points_total = _safe_number(aggregate.get("raw_goal_points_total"))
@@ -913,31 +1319,17 @@ def _build_category_breakdown(aggregate: dict[str, Any], baselines: Optional[dic
         + (goals_3_open * 1.0),
         rounds,
     )
-    miss_save_penalty_per_round = _per_round(
-        (missed_shots * 0.5) + (shots_saved * 1.0),
-        rounds,
-    )
-    effective_shooting_points_per_round = (
-        actual_points_per_round + shot_type_bonus_per_round - miss_save_penalty_per_round
-        if rounds
-        else 0.0
-    )
-    shooting_overall = _normalized_category_score("shooting", effective_shooting_points_per_round, baselines)
-    if shooting_overall is None and rounds:
-        shooting_overall = round(max(0.0, (effective_shooting_points_per_round / 15.0) * 100.0), 1)
+    miss_save_penalty_per_round = _per_round((missed_shots * 0.5) + (shots_saved * 1.0), rounds)
+    effective_shooting_points_per_round = actual_points_per_round + shot_type_bonus_per_round - miss_save_penalty_per_round
 
     avg_time_to_offense = _average_from_totals(totals.get("offensive_transition_total"), totals.get("offensive_transition_count"))
     avg_time_to_defense = _average_from_totals(totals.get("defensive_transition_total"), totals.get("defensive_transition_count"))
-    speed_effective_value = _weighted_score(
-        [
-            (_inverse_time_score(avg_time_to_offense, 2.5), 0.45),
-            (_inverse_time_score(avg_time_to_defense, 2.5), 0.45),
-            (_inverse_time_score(avg_possession_time_per_touch, 2.0), 0.10),
-        ]
-    )
-    speed_overall = _normalized_category_score("speed", speed_effective_value, baselines)
-    if speed_overall is None:
-        speed_overall = speed_effective_value
+    speed_components = [
+        (_inverse_time_score(avg_time_to_offense, 2.5), 0.45),
+        (_inverse_time_score(avg_time_to_defense, 2.5), 0.45),
+        (_inverse_time_score(avg_possession_time_per_touch, 2.0), 0.10),
+    ]
+    speed_effective_value = _weighted_score(speed_components)
 
     possession_effective_per_round = (
         _per_round(inferred_interceptions, rounds) * 2.5
@@ -949,9 +1341,6 @@ def _build_category_breakdown(aggregate: dict[str, Any], baselines: Optional[dic
     )
     if avg_possession_time_per_touch is not None:
         possession_effective_per_round += min(float(avg_possession_time_per_touch) / 3.0, 1.0) * 0.75
-    possession_overall = _normalized_category_score("possession", possession_effective_per_round, baselines)
-    if possession_overall is None:
-        possession_overall = _score_from_target(possession_effective_per_round, 4.0)
 
     offense_effective_per_round = (
         _per_round(completed_passes, rounds) * 0.4
@@ -967,9 +1356,6 @@ def _build_category_breakdown(aggregate: dict[str, Any], baselines: Optional[dic
     )
     if open_pass_rate is not None:
         offense_effective_per_round += (float(open_pass_rate) / 100.0) * 1.0
-    offense_overall = _normalized_category_score("offense", offense_effective_per_round, baselines)
-    if offense_overall is None:
-        offense_overall = _score_from_target(offense_effective_per_round, 6.0)
 
     tight_coverage_score = (float(tight_coverage_rate) / 100.0) * 1.0 if tight_coverage_rate is not None else 0.0
     goalie_coverage_score = (float(goalie_coverage_rate) / 100.0) * 0.75 if goalie_coverage_rate is not None else 0.0
@@ -993,9 +1379,6 @@ def _build_category_breakdown(aggregate: dict[str, Any], baselines: Optional[dic
         - no_man_penalty
         - _per_round(lane_coverage_failures, rounds) * 0.75
     )
-    defense_overall = _normalized_category_score("defense", defense_effective_per_round, baselines)
-    if defense_overall is None:
-        defense_overall = _score_from_target(defense_effective_per_round, 4.0)
 
     passing_effective_per_round = (
         _per_round(completed_passes, rounds) * 1.2
@@ -1011,190 +1394,338 @@ def _build_category_breakdown(aggregate: dict[str, Any], baselines: Optional[dic
     )
     if clear_success_rate is not None:
         passing_effective_per_round += (float(clear_success_rate) / 100.0) * 1.5
-    passing_overall = _normalized_category_score("passing", passing_effective_per_round, baselines)
-    if passing_overall is None:
-        passing_overall = _score_from_target(passing_effective_per_round, 5.0)
 
-    normalized_note_suffix = ""
-    if baselines:
-        normalized_note_suffix = " Displayed score is normalized against the current competitive sample."
+    shooting_metrics = [
+        _metric_entry("Guarded 3s", goals_3_guarded, rounds),
+        _metric_entry("Guarded 2s", goals_2_guarded, rounds),
+        _metric_entry("Open 3s", goals_3_open, rounds),
+        _metric_entry("Open 2s", goals_2_open, rounds),
+        _metric_entry("Possible dunk-like open 2s", dunk_like_open_2s, rounds),
+        _metric_entry("Possible dunk-like guarded 2s", dunk_like_guarded_2s, rounds),
+        _metric_entry("Missed shots", missed_shots, rounds),
+        _metric_entry("Shots saved by goalie", shots_saved, rounds),
+        _metric_entry("Stuffed shots", stuffed_shots, rounds),
+        _metric_entry("Self goals", self_goals, rounds),
+        _value_entry("Shooting percentage", _percentage_text(shooting_percentage), "Goals / (missed + saved)"),
+        _value_entry("Actual scoreboard points / round", f"{actual_points_per_round:.2f}" if rounds else "No round data", "Based on real in-game points."),
+        _value_entry("Shot-type bonus / round", f"{shot_type_bonus_per_round:.2f}" if rounds else "No round data", "Guarded 3s = +2, guarded 2s/open 3s = +1, open 2s = +0."),
+        _value_entry("Miss/save penalty / round", f"{miss_save_penalty_per_round:.2f}" if rounds else "No round data", "Misses = -0.5, saved shots = -1."),
+        _value_entry("Effective shooting points / round", f"{effective_shooting_points_per_round:.2f}" if rounds else "No round data", "Raw shooting production input before elite-curve scoring."),
+    ]
+    speed_metrics = [
+        _value_entry("Average time to offense", _seconds_text(avg_time_to_offense), f"Samples {int(_safe_number(totals.get('offensive_transition_count')))}"),
+        _value_entry("Average time to defense", _seconds_text(avg_time_to_defense), f"Samples {int(_safe_number(totals.get('defensive_transition_count')))}"),
+        _value_entry("Average possession time / estimated touch", _seconds_text(avg_possession_time_per_touch), f"Estimated releases {int(round(estimated_possession_releases))}"),
+        _metric_entry("Possession time", float(stat_totals.get("possession_time") or 0.0), rounds, decimals=2, suffix="s"),
+        _value_entry("Speed raw value", f"{float(speed_effective_value):.2f}" if speed_effective_value is not None else "No samples", "Weighted inverse-time production input."),
+    ]
+    possession_metrics = [
+        _metric_entry("Inferred turnovers", inferred_turnovers, rounds),
+        _metric_entry("Inferred interceptions", inferred_interceptions, rounds),
+        _metric_entry("Steal takeaways", steal_takeaways, rounds),
+        _metric_entry("Stun takeaways", stun_takeaways, rounds),
+        _metric_entry("Base steals", base_steals, rounds),
+        _metric_entry("Base turnovers", base_turnovers, rounds),
+        _metric_entry("Failed clears", failed_clears, rounds),
+        _metric_entry("Covered catches", catches_covered, rounds),
+        _metric_entry("Possession time", float(stat_totals.get("possession_time") or 0.0), rounds, decimals=2, suffix="s"),
+        _value_entry("Average possession time / estimated touch", _seconds_text(avg_possession_time_per_touch), f"Estimated releases {int(round(estimated_possession_releases))}"),
+        _value_entry("Effective possession units / round", f"{possession_effective_per_round:.2f}" if rounds else "No round data", "Raw possession production input before elite-curve scoring."),
+    ]
+    offense_metrics = [
+        _metric_entry("Completed passes", completed_passes, rounds),
+        _metric_entry("Initiators", initiators, rounds),
+        _metric_entry("Inferred catches", inferred_catches, rounds),
+        _metric_entry("Assists", base_assists, rounds),
+        _metric_entry("Goals", base_goals, rounds),
+        _metric_entry("Points", base_points, rounds),
+        _metric_entry("Open-pass samples", open_for_pass_samples, rounds),
+        _value_entry("Open-pass rate", _percentage_text(open_pass_rate), "Open samples / (open + lane-blocked samples)"),
+        _metric_entry("Passes to open receiver", passes_to_open_receiver, rounds),
+        _metric_entry("Passes to covered receiver", passes_to_covered_receiver, rounds),
+        _metric_entry("Catches open", catches_open, rounds),
+        _metric_entry("Catches covered", catches_covered, rounds),
+        _metric_entry("Missed shots", missed_shots, rounds),
+        _metric_entry("Shots saved against", shots_saved, rounds),
+        _metric_entry("Stuffed shots", stuffed_shots, rounds),
+        _metric_entry("Self goals", self_goals, rounds),
+        _value_entry("Effective offense units / round", f"{offense_effective_per_round:.2f}" if rounds else "No round data", "Raw offensive production input before elite-curve scoring."),
+    ]
+    defense_metrics = [
+        _metric_entry("Saves", base_saves, rounds),
+        _metric_entry("Inferred interceptions", inferred_interceptions, rounds),
+        _metric_entry("Steal takeaways", steal_takeaways, rounds),
+        _metric_entry("Stun takeaways", stun_takeaways, rounds),
+        _metric_entry("Lane blocks", lane_blocks, rounds),
+        _metric_entry("Tight man coverage samples", tight_man_coverage_samples, rounds),
+        _metric_entry("Loose man coverage samples", loose_man_coverage_samples, rounds),
+        _metric_entry("No-man coverage samples", no_man_coverage_samples, rounds),
+        _metric_entry("Goalie coverage samples", goalie_coverage_samples, rounds),
+        _metric_entry("Lane coverage failures", lane_coverage_failures, rounds),
+        _metric_entry("Shooter uncovered", shooter_uncovered, rounds),
+        _metric_entry("Blocked shots", blocked_shots, rounds),
+        _metric_entry("Stuffed shots", stuffed_shots, rounds),
+        _metric_entry("Base blocks", base_blocks, rounds),
+        _metric_entry("Base steals", base_steals, rounds),
+        _metric_entry("Base interceptions", base_interceptions, rounds),
+        _value_entry("Lane-block rate", _percentage_text(lane_block_rate), "Lane blocks as a share of tracked lane+coverage samples"),
+        _value_entry("Tight coverage rate", _percentage_text(tight_coverage_rate), "Share of tracked defensive coverage samples"),
+        _value_entry("Goalie coverage rate", _percentage_text(goalie_coverage_rate), "Share of tracked defensive coverage samples"),
+        _value_entry("Loose coverage rate", _percentage_text(loose_coverage_rate), "Share of tracked defensive coverage samples"),
+        _value_entry("No-man coverage rate", _percentage_text(no_man_coverage_rate), "Share of tracked defensive coverage samples"),
+        _value_entry("Effective defense units / round", f"{defense_effective_per_round:.2f}" if rounds else "No round data", "Raw defensive production input before elite-curve scoring."),
+    ]
+    passing_metrics = [
+        _metric_entry("Completed passes", completed_passes, rounds),
+        _metric_entry("Inferred catches", inferred_catches, rounds),
+        _metric_entry("Clear attempts", clear_attempts, rounds),
+        _metric_entry("Successful clears", successful_clears, rounds),
+        _metric_entry("Failed clears", failed_clears, rounds),
+        _metric_entry("Base catches", base_catches, rounds),
+        _metric_entry("Base passes", base_passes, rounds),
+        _metric_entry("Passes to open receiver", passes_to_open_receiver, rounds),
+        _metric_entry("Passes to covered receiver", passes_to_covered_receiver, rounds),
+        _metric_entry("Catches open", catches_open, rounds),
+        _metric_entry("Catches covered", catches_covered, rounds),
+        _metric_entry("Inferred turnovers", inferred_turnovers, rounds),
+        _metric_entry("Inferred interceptions", inferred_interceptions, rounds),
+        _value_entry("Clear success rate", _percentage_text(clear_success_rate), None),
+        _value_entry("Effective passing units / round", f"{passing_effective_per_round:.2f}" if rounds else "No round data", "Raw passing production input before elite-curve scoring."),
+    ]
 
     return {
-        "shooting": {
-            "title": "Shooting",
-            "overall_score": shooting_overall,
-            "score_note": (
-                "Round-based shooting score anchored to actual scoreboard points per round. "
-                "Guarded 3s add +2 each; guarded 2s and open 3s add +1 each; "
-                "open 2s add no bonus; missed shots subtract 0.5 each; saved shots subtract 1 each. "
-                "Dunk-like guarded 2s are treated like open 2s for bonus purposes. "
-                "15 effective shooting points per round maps to 100. Scores above 100 are allowed."
-                + normalized_note_suffix
-            ),
-            "metrics": [
-                _metric_entry("Guarded 3s", goals_3_guarded, rounds),
-                _metric_entry("Guarded 2s", goals_2_guarded, rounds),
-                _metric_entry("Open 3s", goals_3_open, rounds),
-                _metric_entry("Open 2s", goals_2_open, rounds),
-                _metric_entry("Possible dunk-like open 2s", dunk_like_open_2s, rounds),
-                _metric_entry("Possible dunk-like guarded 2s", dunk_like_guarded_2s, rounds),
-                _metric_entry("Missed shots", missed_shots, rounds),
-                _metric_entry("Shots saved by goalie", shots_saved, rounds),
-                _value_entry("Shooting percentage", _percentage_text(shooting_percentage), "Goals / (missed + saved)"),
-                _value_entry(
-                    "Actual scoreboard points / round",
-                    f"{actual_points_per_round:.2f}" if rounds else "No round data",
-                    "Based on real in-game points.",
-                ),
-                _value_entry(
-                    "Shot-type bonus / round",
-                    f"{shot_type_bonus_per_round:.2f}" if rounds else "No round data",
-                    "Guarded 3s = +2, guarded 2s/open 3s = +1, open 2s = +0.",
-                ),
-                _value_entry(
-                    "Miss/save penalty / round",
-                    f"{miss_save_penalty_per_round:.2f}" if rounds else "No round data",
-                    "Misses = -0.5, saved shots = -1.",
-                ),
-                _value_entry(
-                    "Effective shooting points / round",
-                    f"{effective_shooting_points_per_round:.2f}" if rounds else "No round data",
-                    "15 effective points per round maps to a score of 100.",
-                ),
+        "shooting": _category_score_entry(
+            "shooting",
+            "Shooting",
+            raw_value=effective_shooting_points_per_round,
+            rounds=rounds,
+            scoring_mode=scoring_mode,
+            score_note="Base shooting uses a fixed elite curve on effective shooting points per round, then mistake-adjusted mode subtracts missed, saved, stuffed, and self-goal penalties before confidence adjustment.",
+            metrics=shooting_metrics,
+            positive_inputs=[
+                ("Guarded 3s", goals_3_guarded * 2.0),
+                ("Guarded 2s", adjusted_guarded_2_for_bonus * 1.0),
+                ("Open 3s", goals_3_open * 1.0),
+                ("Open 2s", goals_2_open * 0.5),
+                ("Scoreboard points / round", actual_points_per_round),
             ],
-        },
-        "speed": {
-            "title": "Speed",
-            "overall_score": speed_overall,
-            "score_note": "Lower transition times score better. Average possession time per estimated touch is used as a smaller release-speed input." + normalized_note_suffix,
-            "metrics": [
-                _value_entry(
-                    "Average time to offense",
-                    _seconds_text(avg_time_to_offense),
-                    f"Samples {int(_safe_number(totals.get('offensive_transition_count')))}",
-                ),
-                _value_entry(
-                    "Average time to defense",
-                    _seconds_text(avg_time_to_defense),
-                    f"Samples {int(_safe_number(totals.get('defensive_transition_count')))}",
-                ),
-                _value_entry(
-                    "Average possession time / estimated touch",
-                    _seconds_text(avg_possession_time_per_touch),
-                    f"Estimated releases {int(round(estimated_possession_releases))}",
-                ),
-                _metric_entry("Possession time", float(stat_totals.get("possession_time") or 0.0), rounds, decimals=2, suffix="s"),
+            mistake_inputs=[
+                ("Missed shots", 2.0 * _per_round(missed_shots, rounds)),
+                ("Shots saved against", 3.0 * _per_round(shots_saved, rounds)),
+                ("Stuffed shots", 4.5 * _per_round(stuffed_shots, rounds)),
+                ("Self goals", 20.0 * _per_round(self_goals, rounds)),
             ],
-        },
-        "possession": {
-            "title": "Possession",
-            "overall_score": possession_overall,
-            "score_note": "Per-round possession control score. Interceptions and takeaways help; turnovers hurt. Average hold time per touch adds a small bonus." + normalized_note_suffix,
-            "metrics": [
-                _metric_entry("Inferred turnovers", _safe_number(totals.get("inferred_turnovers")), rounds),
-                _metric_entry("Inferred interceptions", _safe_number(totals.get("inferred_interceptions")), rounds),
-                _metric_entry("Steal takeaways", _safe_number(totals.get("steal_takeaways")), rounds),
-                _metric_entry("Stun takeaways", _safe_number(totals.get("stun_takeaways")), rounds),
-                _metric_entry("Base steals", _safe_number(stat_totals.get("steals")), rounds),
-                _metric_entry("Base turnovers", _safe_number(stat_totals.get("turnovers")), rounds),
-                _metric_entry("Possession time", float(stat_totals.get("possession_time") or 0.0), rounds, decimals=2, suffix="s"),
-                _value_entry(
-                    "Average possession time / estimated touch",
-                    _seconds_text(avg_possession_time_per_touch),
-                    f"Estimated releases {int(round(estimated_possession_releases))}",
-                ),
-                _value_entry(
-                    "Effective possession units / round",
-                    f"{possession_effective_per_round:.2f}" if rounds else "No round data",
-                    "4 effective units per round maps to a score of 100.",
-                ),
+            mistake_cap=35.0,
+        ),
+        "speed": _category_score_entry(
+            "speed",
+            "Speed",
+            raw_value=speed_effective_value,
+            rounds=rounds,
+            scoring_mode=scoring_mode,
+            score_note="Base speed uses a fixed elite curve on weighted transition speed. Mistake-adjusted mode subtracts time-over-target penalties, then low samples are pulled toward 50.",
+            metrics=speed_metrics,
+            positive_inputs=[
+                ("Average time to offense", _safe_number(speed_components[0][0])),
+                ("Average time to defense", _safe_number(speed_components[1][0])),
+                ("Release speed", _safe_number(speed_components[2][0])),
             ],
-        },
-        "offense": {
-            "title": "Offense",
-            "overall_score": offense_overall,
-            "score_note": "Per-round offensive creation score. Points, assists, goals, initiators, and quality passing involvement all contribute." + normalized_note_suffix,
-            "metrics": [
-                _metric_entry("Completed passes", _safe_number(totals.get("completed_passes")), rounds),
-                _metric_entry("Initiators", _safe_number(totals.get("initiators")), rounds),
-                _metric_entry("Inferred catches", _safe_number(totals.get("inferred_catches")), rounds),
-                _metric_entry("Assists", _safe_number(stat_totals.get("assists")), rounds),
-                _metric_entry("Goals", _safe_number(stat_totals.get("goals")), rounds),
-                _metric_entry("Points", _safe_number(stat_totals.get("points")), rounds),
-                _metric_entry("Open-pass samples", _safe_number(totals.get("open_for_pass_samples")), rounds),
-                _value_entry("Open-pass rate", _percentage_text(open_pass_rate), "Open samples / (open + lane-blocked samples)"),
-                _metric_entry("Passes to open receiver", passes_to_open_receiver, rounds),
-                _metric_entry("Passes to covered receiver", passes_to_covered_receiver, rounds),
-                _metric_entry("Catches open", catches_open, rounds),
-                _metric_entry("Catches covered", catches_covered, rounds),
-                _value_entry(
-                    "Effective offense units / round",
-                    f"{offense_effective_per_round:.2f}" if rounds else "No round data",
-                    "6 effective units per round maps to a score of 100.",
-                ),
+            mistake_inputs=[
+                ("Slow offensive transitions", 5.0 * max(0.0, float(avg_time_to_offense or 0.0) - 1.5)),
+                ("Slow defensive transitions", 5.0 * max(0.0, float(avg_time_to_defense or 0.0) - 1.5)),
             ],
-        },
-        "defense": {
-            "title": "Defense",
-            "overall_score": defense_overall,
-            "score_note": "Per-round defensive impact score. Saves, takeaways, lane-block rate, and stronger coverage help; lane failures and weak coverage hurt." + normalized_note_suffix,
-            "metrics": [
-                _metric_entry("Saves", _safe_number(stat_totals.get("saves")), rounds),
-                _metric_entry("Inferred interceptions", _safe_number(totals.get("inferred_interceptions")), rounds),
-                _metric_entry("Steal takeaways", _safe_number(totals.get("steal_takeaways")), rounds),
-                _metric_entry("Stun takeaways", _safe_number(totals.get("stun_takeaways")), rounds),
-                _metric_entry("Lane blocks", _safe_number(totals.get("lane_blocks")), rounds),
-                _metric_entry("Tight man coverage samples", _safe_number(totals.get("tight_man_coverage_samples")), rounds),
-                _metric_entry("Loose man coverage samples", _safe_number(totals.get("loose_man_coverage_samples")), rounds),
-                _metric_entry("No-man coverage samples", _safe_number(totals.get("no_man_coverage_samples")), rounds),
-                _metric_entry("Goalie coverage samples", _safe_number(totals.get("goalie_coverage_samples")), rounds),
-                _metric_entry("Lane coverage failures", lane_coverage_failures, rounds),
-                _metric_entry("Blocked shots", blocked_shots, rounds),
-                _metric_entry("Stuffed shots", stuffed_shots, rounds),
-                _metric_entry("Base blocks", _safe_number(stat_totals.get("blocks")), rounds),
-                _metric_entry("Base steals", _safe_number(stat_totals.get("steals")), rounds),
-                _metric_entry("Base interceptions", _safe_number(stat_totals.get("interceptions")), rounds),
-                _value_entry("Lane-block rate", _percentage_text(lane_block_rate), "Lane blocks as a share of tracked lane+coverage samples"),
-                _value_entry("Tight coverage rate", _percentage_text(tight_coverage_rate), "Share of tracked defensive coverage samples"),
-                _value_entry("Goalie coverage rate", _percentage_text(goalie_coverage_rate), "Share of tracked defensive coverage samples"),
-                _value_entry("Loose coverage rate", _percentage_text(loose_coverage_rate), "Share of tracked defensive coverage samples"),
-                _value_entry("No-man coverage rate", _percentage_text(no_man_coverage_rate), "Share of tracked defensive coverage samples"),
-                _value_entry(
-                    "Effective defense units / round",
-                    f"{defense_effective_per_round:.2f}" if rounds else "No round data",
-                    "6 effective units per round maps to a score of 100.",
-                ),
+            mistake_cap=25.0,
+        ),
+        "possession": _category_score_entry(
+            "possession",
+            "Possession",
+            raw_value=possession_effective_per_round,
+            rounds=rounds,
+            scoring_mode=scoring_mode,
+            score_note="Base possession rewards takeaways and control. Mistake-adjusted mode subtracts turnovers, failed clears, and covered catches before confidence adjustment.",
+            metrics=possession_metrics,
+            positive_inputs=[
+                ("Inferred interceptions", _per_round(inferred_interceptions, rounds) * 2.5),
+                ("Steal takeaways", _per_round(steal_takeaways, rounds) * 1.5),
+                ("Stun takeaways", _per_round(stun_takeaways, rounds) * 1.25),
+                ("Base steals", _per_round(base_steals, rounds) * 1.0),
             ],
-        },
-        "passing": {
-            "title": "Passing",
-            "overall_score": passing_overall,
-            "score_note": "Per-round passing score. Completed passes, catches, and successful clears help; failed clears and covered passes hurt." + normalized_note_suffix,
-            "metrics": [
-                _metric_entry("Completed passes", _safe_number(totals.get("completed_passes")), rounds),
-                _metric_entry("Inferred catches", _safe_number(totals.get("inferred_catches")), rounds),
-                _metric_entry("Clear attempts", _safe_number(totals.get("clear_attempts")), rounds),
-                _metric_entry("Successful clears", _safe_number(totals.get("successful_clears")), rounds),
-                _metric_entry("Failed clears", _safe_number(totals.get("failed_clears")), rounds),
-                _metric_entry("Base catches", _safe_number(stat_totals.get("catches")), rounds),
-                _metric_entry("Base passes", _safe_number(stat_totals.get("passes")), rounds),
-                _metric_entry("Passes to open receiver", passes_to_open_receiver, rounds),
-                _metric_entry("Passes to covered receiver", passes_to_covered_receiver, rounds),
-                _metric_entry("Catches open", catches_open, rounds),
-                _metric_entry("Catches covered", catches_covered, rounds),
-                _value_entry(
-                    "Clear success rate",
-                    _percentage_text(clear_success_rate),
-                    None,
-                ),
-                _value_entry(
-                    "Effective passing units / round",
-                    f"{passing_effective_per_round:.2f}" if rounds else "No round data",
-                    "5 effective units per round maps to a score of 100.",
-                ),
+            mistake_inputs=[
+                ("Inferred turnovers", 1.25 * _per_round(inferred_turnovers, rounds)),
+                ("Failed clears", 3.0 * _per_round(failed_clears, rounds)),
+                ("Covered catches", 0.6 * _per_round(catches_covered, rounds)),
             ],
-        },
+            mistake_cap=35.0,
+        ),
+        "offense": _category_score_entry(
+            "offense",
+            "Offense",
+            raw_value=offense_effective_per_round,
+            rounds=rounds,
+            scoring_mode=scoring_mode,
+            score_note="Base offense rewards creation: assists, goals, points, initiators, and quality pass involvement. Mistake-adjusted mode subtracts turnovers and bad shooting outcomes.",
+            metrics=offense_metrics,
+            positive_inputs=[
+                ("Assists", _per_round(base_assists, rounds) * 1.5),
+                ("Initiators", _per_round(initiators, rounds) * 1.5),
+                ("Goals", _per_round(base_goals, rounds) * 1.25),
+                ("Points", _per_round(base_points, rounds) * 0.35),
+                ("Completed passes", _per_round(completed_passes, rounds) * 0.4),
+            ],
+            mistake_inputs=[
+                ("Inferred turnovers", 1.0 * _per_round(inferred_turnovers, rounds)),
+                ("Missed shots", 1.4 * _per_round(missed_shots, rounds)),
+                ("Shots saved against", 2.0 * _per_round(shots_saved, rounds)),
+                ("Stuffed shots", 3.5 * _per_round(stuffed_shots, rounds)),
+                ("Self goals", 20.0 * _per_round(self_goals, rounds)),
+            ],
+            mistake_cap=35.0,
+        ),
+        "defense": _category_score_entry(
+            "defense",
+            "Defense",
+            raw_value=defense_effective_per_round,
+            rounds=rounds,
+            scoring_mode=scoring_mode,
+            score_note="Base defense rewards saves, takeaways, lane blocks, and stronger coverage. Mistake-adjusted mode subtracts uncovered shooters, lane failures, and no-man coverage pressure.",
+            metrics=defense_metrics,
+            positive_inputs=[
+                ("Saves", _per_round(base_saves, rounds) * 3.0),
+                ("Inferred interceptions", _per_round(inferred_interceptions, rounds) * 1.5),
+                ("Steal takeaways", _per_round(steal_takeaways, rounds) * 1.25),
+                ("Lane blocks", _per_round(lane_blocks, rounds) * 1.0),
+                ("Tight coverage", tight_coverage_score),
+            ],
+            mistake_inputs=[
+                ("Shooter uncovered", 7.0 * _per_round(shooter_uncovered, rounds)),
+                ("Lane coverage failures", 8.0 * _per_round(lane_coverage_failures, rounds)),
+                ("No-man coverage samples", 0.003 * _per_round(no_man_coverage_samples, rounds)),
+            ],
+            mistake_cap=30.0,
+        ),
+        "passing": _category_score_entry(
+            "passing",
+            "Passing",
+            raw_value=passing_effective_per_round,
+            rounds=rounds,
+            scoring_mode=scoring_mode,
+            score_note="Base passing rewards completed passes, catches, and good clears. Mistake-adjusted mode subtracts covered receivers, turnovers, and intercepted outcomes before confidence adjustment.",
+            metrics=passing_metrics,
+            positive_inputs=[
+                ("Completed passes", _per_round(completed_passes, rounds) * 1.2),
+                ("Inferred catches", _per_round(inferred_catches, rounds) * 0.6),
+                ("Successful clears", _per_round(successful_clears, rounds) * 1.0),
+                ("Passes to open receiver", _per_round(passes_to_open_receiver, rounds) * 0.35),
+            ],
+            mistake_inputs=[
+                ("Passes to covered receiver", 1.4 * _per_round(passes_to_covered_receiver, rounds)),
+                ("Inferred turnovers", 0.9 * _per_round(inferred_turnovers, rounds)),
+                ("Inferred interceptions", 1.5 * _per_round(inferred_interceptions, rounds)),
+            ],
+            mistake_cap=35.0,
+        ),
     }
+
+
+def _reference_category_scores(reference_breakdowns: list[dict[str, Any]], category_key: str) -> list[float]:
+    values: list[float] = []
+    for breakdown in reference_breakdowns:
+        detail = breakdown.get(category_key)
+        if not isinstance(detail, dict):
+            continue
+        score = _extract_category_absolute_score(detail)
+        if score is not None:
+            values.append(float(score))
+    return values
+
+
+def _reference_overall_scores(reference_breakdowns: list[dict[str, Any]]) -> list[float]:
+    values: list[float] = []
+    for breakdown in reference_breakdowns:
+        score = _breakdown_overall_score(breakdown, score_key="absolute_score")
+        if score is not None:
+            values.append(float(score))
+    return values
+
+
+def _breakdown_overall_score(
+    category_breakdown: Mapping[str, Any],
+    *,
+    score_key: str,
+) -> Optional[float]:
+    values: list[float] = []
+    for category_key in DISPLAY_CATEGORY_ORDER:
+        detail = category_breakdown.get(category_key)
+        if not isinstance(detail, Mapping):
+            continue
+        score = detail.get(score_key)
+        if score is None and score_key == "absolute_score":
+            score = _extract_category_absolute_score(detail)
+        elif score is None and score_key == "display_score":
+            score = detail.get("display_score")
+        if score is None:
+            continue
+        values.append(float(score))
+    if not values:
+        return None
+    return sum(values) / float(len(values))
+
+
+def _extract_category_absolute_score(category: Mapping[str, Any]) -> Optional[float]:
+    for key in ("absolute_score", "overall_score", "final_score"):
+        value = category.get(key)
+        if value is not None:
+            return float(value)
+    return None
+
+
+def _relative_percentile(value: Optional[float], reference_values: Iterable[Any]) -> Optional[float]:
+    if value is None:
+        return None
+    values = sorted(float(item) for item in reference_values if item is not None)
+    if len(values) < 2:
+        return None
+    if abs(values[-1] - values[0]) < 0.0001:
+        return None
+
+    numeric_value = float(value)
+    left = bisect_left(values, numeric_value)
+    right = bisect_right(values, numeric_value)
+    denominator = float(len(values) - 1)
+
+    if right > left:
+        position = (float(left) + float(right - 1)) / 2.0
+        return (position / denominator) * 100.0
+
+    upper_index = min(left, len(values) - 1)
+    lower_index = max(0, upper_index - 1)
+    lower_value = values[lower_index]
+    upper_value = values[upper_index]
+
+    if numeric_value <= values[0]:
+        return 0.0
+    if numeric_value >= values[-1]:
+        return 100.0
+    if abs(upper_value - lower_value) < 0.0001:
+        position = float(lower_index)
+    else:
+        fraction = (numeric_value - lower_value) / (upper_value - lower_value)
+        position = float(lower_index) + fraction
+    return (position / denominator) * 100.0
+
+
+def _hybrid_display_score(
+    absolute_score: Optional[float],
+    percentile: Optional[float],
+    absolute_weight: float,
+) -> Optional[float]:
+    if absolute_score is None:
+        return None
+    if percentile is None:
+        return float(absolute_score)
+    weight = max(0.0, min(1.0, float(absolute_weight)))
+    percentile_weight = 1.0 - weight
+    return _clamp_score((float(absolute_score) * weight) + (float(percentile) * percentile_weight))
 
 
 def _metric_entry(label: str, total: float, rounds: int, *, decimals: int = 0, suffix: str = "") -> dict[str, Any]:
@@ -1221,6 +1752,80 @@ def _value_entry(label: str, value: str, note: Optional[str]) -> dict[str, Any]:
     return {"label": label, "value": value, "note": note}
 
 
+def _category_score_entry(
+    category_key: str,
+    title: str,
+    *,
+    raw_value: Optional[float],
+    rounds: float,
+    scoring_mode: str,
+    score_note: str,
+    metrics: list[dict[str, Any]],
+    positive_inputs: list[tuple[str, float]],
+    mistake_inputs: list[tuple[str, float]],
+    mistake_cap: float,
+) -> dict[str, Any]:
+    normalized_mode = _normalize_category_scoring_mode(scoring_mode)
+    base_score = _elite_curve_score(category_key, raw_value)
+    mistake_penalty = min(mistake_cap, sum(max(0.0, float(value)) for _label, value in mistake_inputs))
+    if base_score is None:
+        mistake_adjusted_score = None
+        final_score = None
+    else:
+        mistake_adjusted_score = _clamp_score(base_score - mistake_penalty)
+        production_score = base_score if normalized_mode == "production_only" else mistake_adjusted_score
+        final_score = _clamp_score(
+            50.0 + (_sample_confidence(rounds) * (float(production_score) - 50.0))
+        )
+    sample_confidence = _sample_confidence(rounds)
+    confidence_label = _confidence_label(rounds)
+    main_positive_inputs = _top_named_inputs(positive_inputs)
+    main_mistake_inputs = _top_named_inputs(mistake_inputs)
+    explanation = _category_explanation(title, main_positive_inputs, main_mistake_inputs, confidence_label)
+
+    summary_metrics = [
+        _value_entry("Scoring mode", _scoring_mode_label(normalized_mode), "Switch in CLI or GUI to compare modes."),
+        _value_entry("Final score", _number_text(final_score, decimals=1), "Displayed score after mode + confidence adjustment."),
+        _value_entry("Base production score", _number_text(base_score, decimals=1), "Fixed elite-curve score before mistake penalties."),
+        _value_entry("Mistake penalty", f"-{mistake_penalty:.1f}", f"Capped at {mistake_cap:.0f}"),
+        _value_entry("Mistake-adjusted score", _number_text(mistake_adjusted_score, decimals=1), "Base score minus tracked mistake penalty."),
+        _value_entry("Rounds considered", _number_text(rounds, decimals=2), None),
+        _value_entry("Sample confidence", f"{sample_confidence:.2f}", confidence_label.title()),
+        _value_entry("Raw category value", _number_text(raw_value, decimals=2), None),
+    ]
+    if main_positive_inputs:
+        summary_metrics.append(_value_entry("Main positives", ", ".join(main_positive_inputs), None))
+    if main_mistake_inputs:
+        summary_metrics.append(_value_entry("Main issues", ", ".join(main_mistake_inputs), None))
+    summary_metrics.append(_value_entry("Explanation", explanation, None))
+
+    return {
+        "category": title,
+        "category_name": title,
+        "title": title,
+        "raw_value": _rounded_optional(raw_value, decimals=4),
+        "rounds_considered": _rounded_optional(rounds, decimals=3),
+        "base_score": _rounded_optional(base_score, decimals=1),
+        "mistake_penalty": round(mistake_penalty, 1),
+        "mistake_adjusted_score": _rounded_optional(mistake_adjusted_score, decimals=1),
+        "sample_confidence": round(sample_confidence, 3),
+        "confidence_label": confidence_label,
+        "absolute_score": _rounded_optional(final_score, decimals=1),
+        "final_score": _rounded_optional(final_score, decimals=1),
+        "overall_score": _rounded_optional(final_score, decimals=1),
+        "display_score": _rounded_optional(final_score, decimals=1),
+        "display_percentile": None,
+        "display_context": None,
+        "display_reference_count": 0,
+        "main_positive_inputs": main_positive_inputs,
+        "main_mistake_inputs": main_mistake_inputs,
+        "explanation": explanation,
+        "score_note": score_note,
+        "scoring_mode": normalized_mode,
+        "metrics": summary_metrics + metrics,
+    }
+
+
 def _per_round(value: float, rounds: int) -> float:
     if rounds <= 0:
         return 0.0
@@ -1237,6 +1842,112 @@ def _percentage_text(value: Optional[float]) -> str:
     if value is None:
         return "No samples"
     return f"{float(value):.2f}%"
+
+
+def _normalize_category_scoring_mode(value: Optional[str]) -> str:
+    normalized = str(value or "mistake_adjusted").strip().casefold()
+    return "production_only" if normalized == "production_only" else "mistake_adjusted"
+
+
+def _scoring_mode_label(mode: str) -> str:
+    return "Production Only" if _normalize_category_scoring_mode(mode) == "production_only" else "Mistake Adjusted"
+
+
+def _elite_curve_score(category_key: str, raw_value: Optional[float]) -> Optional[float]:
+    if raw_value is None:
+        return None
+    anchors = CATEGORY_SCORE_ANCHORS.get(category_key)
+    if not anchors:
+        return None
+    anchor_50 = float(anchors["anchor_50"])
+    anchor_100 = float(anchors["anchor_100"])
+    if anchor_100 <= anchor_50:
+        return None
+    k_value = math.log(10.0) / (anchor_100 - anchor_50)
+    score = 110.0 / (1.0 + math.exp(-k_value * (float(raw_value) - anchor_50)))
+    return round(_clamp_score(score), 1)
+
+
+def _sample_confidence(rounds: float) -> float:
+    numeric_rounds = max(0.0, float(rounds or 0.0))
+    return min(1.0, math.sqrt(numeric_rounds / 10.0)) if numeric_rounds > 0.0 else 0.0
+
+
+def _confidence_label(rounds: float) -> str:
+    numeric_rounds = max(0.0, float(rounds or 0.0))
+    if numeric_rounds < 3.0:
+        return "very low sample"
+    if numeric_rounds < 5.0:
+        return "low sample"
+    if numeric_rounds < 10.0:
+        return "medium sample"
+    return "stable sample"
+
+
+def _top_named_inputs(inputs: list[tuple[str, float]], limit: int = 3) -> list[str]:
+    ranked = [
+        (str(label), float(value))
+        for label, value in inputs
+        if float(value) > 0.0
+    ]
+    ranked.sort(key=lambda row: row[1], reverse=True)
+    return [label for label, _value in ranked[:limit]]
+
+
+def _category_explanation(
+    title: str,
+    main_positive_inputs: list[str],
+    main_mistake_inputs: list[str],
+    confidence_label: str,
+) -> str:
+    if main_positive_inputs and main_mistake_inputs:
+        return (
+            f"{title} production is driven by {', '.join(main_positive_inputs[:2])}, "
+            f"but reduced by {', '.join(main_mistake_inputs[:3])}. "
+            f"Confidence: {confidence_label}."
+        )
+    if main_positive_inputs:
+        return (
+            f"{title} production is mostly driven by {', '.join(main_positive_inputs[:3])}. "
+            f"Few tracked mistake penalties were found. Confidence: {confidence_label}."
+        )
+    if main_mistake_inputs:
+        return (
+            f"{title} has limited tracked production and is mainly being pulled down by "
+            f"{', '.join(main_mistake_inputs[:3])}. Confidence: {confidence_label}."
+        )
+    return f"{title} does not have enough tracked positive or mistake signals yet. Confidence: {confidence_label}."
+
+
+def _rounded_optional(value: Optional[float], *, decimals: int) -> Optional[float]:
+    if value is None:
+        return None
+    return round(float(value), decimals)
+
+
+def _number_text(value: Optional[float], *, decimals: int = 1) -> str:
+    if value is None:
+        return "No data"
+    return f"{float(value):.{decimals}f}"
+
+
+def _clamp_score(value: float) -> float:
+    return max(0.0, min(110.0, float(value)))
+
+
+def _mean_optional(values: Iterable[Any]) -> Optional[float]:
+    numbers = [float(value) for value in values if value is not None]
+    if not numbers:
+        return None
+    return round(statistics.mean(numbers), 4)
+
+
+def _most_common_strings(values: Iterable[str], limit: int = 5) -> list[dict[str, Any]]:
+    counter = Counter(str(value) for value in values if str(value).strip())
+    return [
+        {"label": label, "count": count}
+        for label, count in counter.most_common(limit)
+    ]
 
 
 def _competitive_category_baselines(rows: list[Any]) -> dict[str, dict[str, Any]]:

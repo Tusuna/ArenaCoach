@@ -124,7 +124,8 @@ def create_application(argv: list[str] | None = None) -> QApplication:
         return existing
     app = QApplication(argv if argv is not None else sys.argv)
     app.setApplicationName("Arena Coach")
-    app.setStyleSheet(dark_theme())
+    app.setProperty("arena_coach_zoom", 1.0)
+    app.setStyleSheet(dark_theme(1.0))
     return app
 
 

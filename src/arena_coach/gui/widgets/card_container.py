@@ -30,13 +30,15 @@ class CardContainer(QWidget):
         self.layout_root = QVBoxLayout(self)
         self.layout_root.setContentsMargins(0, 0, 0, 0)
         self.layout_root.setSpacing(10)
+        self.layout_root.setAlignment(Qt.AlignTop)
+        self.layout_root.setSizeConstraint(QVBoxLayout.SetMinAndMaxSize)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
     def add_card(self, card_id: str, title: str, widget: QWidget) -> None:
         wrapper = _CardWrapper(card_id, title, widget)
         wrapper.move_up_requested.connect(lambda card_id=card_id: self.move_card(card_id, -1))
         wrapper.move_down_requested.connect(lambda card_id=card_id: self.move_card(card_id, 1))
-        wrapper.size_changed.connect(lambda _size, card_id=card_id: self._emit_sizes_changed())
+        wrapper.size_changed.connect(self._handle_card_size_changed)
         wrapper.set_customize_mode(self._customize_mode)
         self._cards[card_id] = wrapper
         self._default_order.append(card_id)
@@ -129,12 +131,22 @@ class CardContainer(QWidget):
         self.adjustSize()
         parent = self.parentWidget()
         while parent is not None:
+            layout = parent.layout()
+            if layout is not None:
+                layout.invalidate()
+                layout.activate()
             parent.updateGeometry()
             parent.adjustSize()
+            parent.update()
             parent = parent.parentWidget()
+        self.update()
 
     def _emit_sizes_changed(self) -> None:
         self.sizes_changed.emit(self.card_sizes())
+
+    def _handle_card_size_changed(self, _size: int) -> None:
+        self.refresh_layout()
+        self._emit_sizes_changed()
 
     def _rebuild(self) -> None:
         while self.layout_root.count():
@@ -146,7 +158,6 @@ class CardContainer(QWidget):
             wrapper = self._cards[card_id]
             wrapper.set_move_state(index > 0, index < len(self._order) - 1)
             self.layout_root.addWidget(wrapper)
-        self.layout_root.addStretch()
         self.refresh_layout()
 
 
@@ -209,17 +220,21 @@ class _CardWrapper(QFrame):
             self._saved_height = None
             self.setMinimumHeight(0)
             self.setMaximumHeight(16777215)
+            self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
             self.updateGeometry()
             self.adjustSize()
             return
         normalized = max(80, int(height))
         self._saved_height = normalized
-        self.setFixedHeight(normalized)
+        self.setMinimumHeight(normalized)
+        self.setMaximumHeight(normalized)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.updateGeometry()
 
     def _resize_by_delta(self, delta_y: int) -> None:
         base_height = self._saved_height or self.height()
         self.set_saved_height(base_height + delta_y)
+        self.size_changed.emit(self._saved_height or self.height())
 
     def _emit_size_changed(self) -> None:
         self.size_changed.emit(self._saved_height or self.height())

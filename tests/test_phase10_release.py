@@ -9,9 +9,12 @@ from zipfile import ZipFile
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PySide6.QtCore import Qt
+
 from arena_coach.config import AppConfig
 from arena_coach.database import connect_database, initialize_database
 from arena_coach.gui.app import create_application
+from arena_coach.gui.widgets.match_history_panel import _scoreboard_items
 from arena_coach.gui.main_window import MainWindow
 from arena_coach.main import main as cli_main
 from arena_coach.services.data_exchange_service import DataExchangeService
@@ -171,7 +174,9 @@ class Phase10ReleaseTests(unittest.TestCase):
         self.assertNotIn("Remove-Item", setup_script)
 
         launcher_script = Path("run_arena_coach.pyw").read_text(encoding="utf-8")
-        self.assertIn("subprocess.Popen", launcher_script)
+        self.assertIn("subprocess.run", launcher_script)
+        self.assertIn("CREATE_NO_WINDOW", launcher_script)
+        self.assertIn("arena_coach_launcher.log", launcher_script)
 
         tutorial_doc = Path("docs/user_tutorial.md")
         self.assertTrue(tutorial_doc.exists())
@@ -187,6 +192,12 @@ class Phase10ReleaseTests(unittest.TestCase):
         try:
             window.refresh_current_tab_layout()
             window.refresh_all_layouts()
+            window._apply_zoom(1.2, announce=False)
+            self.assertEqual(app.property("arena_coach_zoom"), 1.2)
+            self.assertEqual(window.zoom_in_action.shortcutContext(), Qt.ApplicationShortcut)
+            self.assertEqual(window.zoom_out_action.shortcutContext(), Qt.ApplicationShortcut)
+            self.assertEqual(window.zoom_reset_action.shortcutContext(), Qt.ApplicationShortcut)
+            window._apply_zoom(1.0, announce=False)
         finally:
             window.close()
             app.processEvents()
@@ -199,9 +210,106 @@ class Phase10ReleaseTests(unittest.TestCase):
             self.assertNotIn("public", window.comparison_panel.classification_filter.selected_values())
             self.assertIn("private", window.advanced_summary_panel.classification_filter.selected_values())
             self.assertIn("private", window.comparison_panel.classification_filter.selected_values())
+            self.assertEqual(window.advanced_summary_panel.scoring_mode.currentData(), "mistake_adjusted")
+            self.assertEqual(window.comparison_panel.scoring_mode.currentData(), "mistake_adjusted")
+            self.assertEqual(window.stats_panel.scoring_mode.currentData(), "mistake_adjusted")
         finally:
             window.close()
             app.processEvents()
+
+    def test_scoreboard_hides_low_activity_rows_by_default(self):
+        items = _scoreboard_items(
+            [
+                {
+                    "display_name": "Ghost Row",
+                    "canonical_name": None,
+                    "match_alias": "Ghost Row",
+                    "userid": "u-ghost",
+                    "player_id": None,
+                    "team": "blue",
+                    "points": 0,
+                    "goals": 0,
+                    "assists": 0,
+                    "saves": 0,
+                    "stuns": 0,
+                    "steals": 0,
+                    "shots": 0,
+                    "passes": 0,
+                    "catches": 0,
+                    "turnovers": 0,
+                    "interceptions": 0,
+                    "blocks": 0,
+                    "possession_time": 0.0,
+                    "afk_suspected": False,
+                    "suppressed_default": False,
+                    "advanced_stats": {
+                        "completed_passes": 0,
+                        "inferred_catches": 0,
+                        "clears": 0,
+                        "turnovers": 0,
+                        "interceptions": 0,
+                        "missed_shots": 0,
+                        "shots_saved": 0,
+                        "blocked_shots": 0,
+                        "stuffed_shots": 0,
+                        "active_seconds_observed": 12.0,
+                        "active_rounds_estimated": 0.02,
+                        "movement_distance_observed": 1.0,
+                        "active_signal_samples": 1,
+                        "detail_tooltips": {},
+                        "category_breakdown": {},
+                    },
+                }
+            ],
+            show_roster_rows=False,
+        )
+        self.assertEqual(items, [])
+        visible = _scoreboard_items(
+            [
+                {
+                    "display_name": "Ghost Row",
+                    "canonical_name": None,
+                    "match_alias": "Ghost Row",
+                    "userid": "u-ghost",
+                    "player_id": None,
+                    "team": "blue",
+                    "points": 0,
+                    "goals": 0,
+                    "assists": 0,
+                    "saves": 0,
+                    "stuns": 0,
+                    "steals": 0,
+                    "shots": 0,
+                    "passes": 0,
+                    "catches": 0,
+                    "turnovers": 0,
+                    "interceptions": 0,
+                    "blocks": 0,
+                    "possession_time": 0.0,
+                    "afk_suspected": False,
+                    "suppressed_default": False,
+                    "advanced_stats": {
+                        "completed_passes": 0,
+                        "inferred_catches": 0,
+                        "clears": 0,
+                        "turnovers": 0,
+                        "interceptions": 0,
+                        "missed_shots": 0,
+                        "shots_saved": 0,
+                        "blocked_shots": 0,
+                        "stuffed_shots": 0,
+                        "active_seconds_observed": 12.0,
+                        "active_rounds_estimated": 0.02,
+                        "movement_distance_observed": 1.0,
+                        "active_signal_samples": 1,
+                        "detail_tooltips": {},
+                        "category_breakdown": {},
+                    },
+                }
+            ],
+            show_roster_rows=True,
+        )
+        self.assertEqual(len(visible), 1)
 
     def test_data_cli_commands_smoke(self):
         config_path = self.root / "config.json"
@@ -241,6 +349,18 @@ class Phase10ReleaseTests(unittest.TestCase):
             exit_code = cli_main(["--config", str(config_path), "data", "backup"])
         self.assertEqual(exit_code, 0)
         self.assertIn("backup created:", stdout.getvalue())
+
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            exit_code = cli_main(["--config", str(config_path), "stats", "categories"])
+        self.assertEqual(exit_code, 0)
+        self.assertIn("Category Scores", stdout.getvalue())
+
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            exit_code = cli_main(["--config", str(config_path), "stats", "export-metrics"])
+        self.assertEqual(exit_code, 0)
+        self.assertIn("metric report created:", stdout.getvalue())
 
 
 if __name__ == "__main__":

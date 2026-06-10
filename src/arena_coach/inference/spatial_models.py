@@ -36,6 +36,7 @@ class PlayerState:
     stunned: bool = False
     blocking: bool = False
     actor_player_id: Optional[int] = None
+    stats: dict[str, float] = field(default_factory=dict)
 
     @property
     def best_position(self) -> Optional[Vector3]:

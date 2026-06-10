@@ -73,10 +73,13 @@ def has_meaningful_participation(stats: Dict[str, Any], metadata: Optional[Dict[
     if meaningful_stat_total(stats) > 0:
         return True
     metadata = metadata or {}
+    if isinstance(metadata, dict) and "active_participation" in metadata:
+        return bool(metadata.get("active_participation"))
     afk = metadata.get("afk_detection") if isinstance(metadata, dict) else {}
-    if isinstance(afk, dict) and int(afk.get("live_samples") or 0) >= 120:
+    row_live_samples = int(metadata.get("live_samples") or 0) if isinstance(metadata, dict) else 0
+    if row_live_samples >= 120 and not bool((afk or {}).get("suspected")):
         return True
-    return bool(metadata.get("active_participation"))
+    return False
 
 
 def point_winner(blue_points: Any, orange_points: Any) -> Optional[str]:

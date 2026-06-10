@@ -79,6 +79,9 @@ class PlayerComparisonPanel(QWidget):
         )
         self.last_filter = QComboBox()
         self.last_filter.addItems(["All", "5", "10", "25"])
+        self.scoring_mode = QComboBox()
+        self.scoring_mode.addItem("Mistake Adjusted", "mistake_adjusted")
+        self.scoring_mode.addItem("Production Only", "production_only")
         self.include_afk = QCheckBox("Include suspected AFK")
         self.refresh_button = QPushButton("Refresh")
         self.customize_button = QPushButton("Customize Layout")
@@ -144,6 +147,8 @@ class PlayerComparisonPanel(QWidget):
         filters.addWidget(self.private_type_filter)
         filters.addWidget(QLabel("Last"))
         filters.addWidget(self.last_filter)
+        filters.addWidget(QLabel("Scoring"))
+        filters.addWidget(self.scoring_mode)
         filters.addWidget(self.include_afk)
         filters.addStretch()
         filters.addWidget(self.reset_layout_button)
@@ -171,6 +176,7 @@ class PlayerComparisonPanel(QWidget):
         self.classification_filter.selection_changed.connect(self._classification_filter_changed)
         self.private_type_filter.selection_changed.connect(self.reload)
         self.last_filter.currentIndexChanged.connect(self.reload)
+        self.scoring_mode.currentIndexChanged.connect(self.reload)
         self.include_afk.stateChanged.connect(self.reload)
         self.category_filter.currentIndexChanged.connect(self._reload_category_detail)
         self.refresh_players_button.clicked.connect(self.reload_players)
@@ -323,6 +329,7 @@ class PlayerComparisonPanel(QWidget):
             include_afk_players=self.include_afk.isChecked(),
             private_match_types=tuple(selected_private_types),
             last_n=last_n,
+            category_scoring_mode=str(self.scoring_mode.currentData() or "mistake_adjusted"),
         )
 
     def _clear_payload(self, text: str) -> None:
@@ -347,6 +354,22 @@ class PlayerComparisonPanel(QWidget):
         right_scores = category_scores_from_breakdown(right_categories)
         self.overview_layout.addRow("left player", _label(left_name))
         self.overview_layout.addRow("right player", _label(right_name))
+        self.overview_layout.addRow(
+            f"{left_name} display rating",
+            _label(_format_value(payload.get("left_advanced", {}).get("display_overall_score"))),
+        )
+        self.overview_layout.addRow(
+            f"{right_name} display rating",
+            _label(_format_value(payload.get("right_advanced", {}).get("display_overall_score"))),
+        )
+        self.overview_layout.addRow(
+            f"{left_name} absolute rating",
+            _label(_format_value(payload.get("left_advanced", {}).get("absolute_overall_score"))),
+        )
+        self.overview_layout.addRow(
+            f"{right_name} absolute rating",
+            _label(_format_value(payload.get("right_advanced", {}).get("absolute_overall_score"))),
+        )
         self.overview_layout.addRow("shared matches", _label(shared.get("shared_matches", 0)))
         self.overview_layout.addRow(
             "together / opposed / mixed",
@@ -372,6 +395,10 @@ class PlayerComparisonPanel(QWidget):
                 f"{payload.get('left_advanced', {}).get('competitive_baseline_sample_size', 0)} player-team rows"
             ),
         )
+        self.overview_layout.addRow(
+            "scoring mode",
+            _label(str(payload.get("left_advanced", {}).get("category_scoring_mode") or "mistake_adjusted").replace("_", " ").title()),
+        )
         warnings = list(payload.get("left_advanced", {}).get("warnings") or []) + list(
             payload.get("right_advanced", {}).get("warnings") or []
         )
@@ -382,8 +409,14 @@ class PlayerComparisonPanel(QWidget):
             right_scores,
             left_label="Left Player",
             right_label="Right Player",
-            left_overall=overall_score_from_scores(left_scores),
-            right_overall=overall_score_from_scores(right_scores),
+            left_overall=payload.get("left_advanced", {}).get("display_overall_score")
+            if payload.get("left_advanced", {}).get("display_overall_score") is not None
+            else overall_score_from_scores(left_scores),
+            right_overall=payload.get("right_advanced", {}).get("display_overall_score")
+            if payload.get("right_advanced", {}).get("display_overall_score") is not None
+            else overall_score_from_scores(right_scores),
+            left_details=left_categories,
+            right_details=right_categories,
         )
 
     def _load_category_scores(self, payload: dict[str, Any]) -> None:
@@ -457,7 +490,14 @@ class PlayerComparisonPanel(QWidget):
             if label not in labels:
                 labels.append(label)
         if left_category or right_category:
-            rows.append(_metric_row("Overall Score", _category_score(left_category), _category_score(right_category)))
+            rows.append(
+                _metric_row(
+                    "Display Score",
+                    _category_display_score(left_category),
+                    _category_display_score(right_category),
+                )
+            )
+            rows.append(_metric_row("Absolute Score", _category_absolute_score(left_category), _category_absolute_score(right_category)))
         for label in labels:
             left_value = _metric_display(left_metrics.get(label))
             right_value = _metric_display(right_metrics.get(label))
@@ -581,7 +621,25 @@ def _cell(value: str) -> QLabel:
 def _category_score(category: Optional[dict[str, Any]]) -> Optional[float]:
     if not category:
         return None
-    value = category.get("overall_score")
+    value = category.get("display_score")
+    if value is None:
+        value = category.get("overall_score")
+    return float(value) if value is not None else None
+
+
+def _category_display_score(category: Optional[dict[str, Any]]) -> Optional[float]:
+    if not category:
+        return None
+    value = category.get("display_score")
+    return float(value) if value is not None else None
+
+
+def _category_absolute_score(category: Optional[dict[str, Any]]) -> Optional[float]:
+    if not category:
+        return None
+    value = category.get("absolute_score")
+    if value is None:
+        value = category.get("overall_score")
     return float(value) if value is not None else None
 
 

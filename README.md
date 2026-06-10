@@ -15,10 +15,11 @@ Arena Coach is its own program. Schrodinger's Observer was used only as research
 - private subtypes, AFK flags, round scores, and quality labels
 - advanced inference and advanced player metrics
 - Stats Preview, Advanced Summary, and Compare Players
+- mistake-aware category scores with confidence adjustment
 - export/import/backup tools
 - PySide6 desktop GUI and CLI
 
-Current automated tests: `76`, passing.
+Current automated tests: `80`, passing.
 
 ## Main GUI Tabs
 
@@ -87,6 +88,26 @@ python -m arena_coach.gui.app
 - Low-quality matches are kept in history but excluded from competitive stats by default.
 - Advanced inferred events are stored separately from base normalized events.
 
+## Category Scores
+
+Advanced Summary, Compare Players, and `stats categories` use a five-step score:
+
+1. base production score from a fixed elite logistic curve
+2. category-specific mistake penalty
+3. mistake-adjusted score
+4. sample confidence pull toward `50`
+5. final displayed score, capped at `110`
+
+Quick meaning:
+
+- `100` = strong/elite production for that category
+- `110` = extreme outlier ceiling
+- `base score` = production before mistakes
+- `mistake penalty` = tracked misses, turnovers, coverage failures, and similar errors
+- `confidence` = low-sample scores are pulled toward `50` so tiny samples do not look fake-good or fake-bad
+
+Default mode is `mistake_adjusted`. You can switch to `production_only` in the GUI or CLI to compare formulas.
+
 ## Export / Import / Backups
 
 Arena Coach has tester-friendly sharing built in.
@@ -104,6 +125,7 @@ python -m arena_coach.main data export
 python -m arena_coach.main data import <export.zip>
 python -m arena_coach.main data list-imports
 python -m arena_coach.main data backup
+python -m arena_coach.main stats export-metrics
 ```
 
 External imports are unpacked separately and are not merged into your live database automatically.
@@ -117,6 +139,9 @@ python -m arena_coach.main parse-log <path>
 python -m arena_coach.main import-log <path>
 python -m arena_coach.main matches list
 python -m arena_coach.main stats summary
+python -m arena_coach.main stats categories
+python -m arena_coach.main stats categories --mode production_only
+python -m arena_coach.main stats export-metrics
 python -m arena_coach.main advanced player <player_id>
 python -B -m unittest discover -s tests
 ```
@@ -134,4 +159,5 @@ python -B -m unittest discover -s tests
 - The final polished dashboard is not built yet.
 - Advanced inferred events are heuristic, not absolute truth.
 - AFK detection is suspicion, not proof.
-- Some advanced scoring formulas still need more real competitive data for tuning.
+- Category score formulas are experimental and still need more real competitive data for tuning.
+- `stats export-metrics` is for formula tuning and outside review, not for end-user ranking.

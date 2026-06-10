@@ -358,6 +358,7 @@ def _build_frames(records: list[RawSnapshotRecord], player_ids_by_alias: dict[st
                         stunned=bool(player.get("stunned")),
                         blocking=bool(player.get("blocking")),
                         actor_player_id=player_ids_by_alias.get(alias.casefold()),
+                        stats=_player_stats_snapshot(player.get("stats")),
                     )
                 )
         disc = sp.disc(record.snapshot)
@@ -461,6 +462,18 @@ def _optional_str(value: Any) -> Optional[str]:
         return None
     text = str(value)
     return text or None
+
+
+def _player_stats_snapshot(value: Any) -> dict[str, float]:
+    if not isinstance(value, dict):
+        return {}
+    stats: dict[str, float] = {}
+    for key, raw in value.items():
+        try:
+            stats[str(key)] = float(raw)
+        except (TypeError, ValueError):
+            continue
+    return stats
 
 
 def _dict(value: Any) -> dict[str, Any]:

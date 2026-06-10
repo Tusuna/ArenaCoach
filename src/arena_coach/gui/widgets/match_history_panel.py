@@ -21,10 +21,12 @@ from PySide6.QtWidgets import (
 )
 
 from arena_coach.gui.widgets.card_container import CardContainer
+from arena_coach.gui.widgets.category_radar_widget import category_scores_from_breakdown, overall_score_from_scores
 from arena_coach.gui.widgets.compact_card_list import CompactCardList, TeamScoreboardCard
 from arena_coach.gui.widgets.advanced_analysis_panel import AdvancedAnalysisPanel
 from arena_coach.gui.widgets.event_timeline_panel import EventTimelinePanel
 from arena_coach.gui.widgets.multi_select_menu_button import MultiSelectMenuButton
+from arena_coach.match_context import meaningful_stat_total
 from arena_coach.match_context import private_match_type_label
 from arena_coach.services.advanced_analysis_service import AdvancedAnalysisService
 from arena_coach.services.layout_service import LayoutService
@@ -361,38 +363,41 @@ class MatchHistoryPanel(QWidget):
 def _scoreboard_items(rows: List[Dict[str, Any]], show_roster_rows: bool) -> List[Dict[str, Any]]:
     items = []
     for row in rows:
-        if not show_roster_rows and row.get("suppressed_default"):
+        if not show_roster_rows and (row.get("suppressed_default") or _hide_low_activity_scoreboard_row(row)):
             continue
         name = row.get("display_name") or row.get("canonical_name") or row.get("match_alias")
         advanced = row.get("advanced_stats") or {}
+        detail_tooltips = advanced.get("detail_tooltips") or {}
+        category_breakdown = advanced.get("category_breakdown") or {}
+        radar_scores = category_scores_from_breakdown(category_breakdown) if category_breakdown else {}
         pass_count = int(advanced.get("completed_passes") or row.get("passes") or 0)
         base_chips = [
-            f"Pts {int(row.get('points') or 0)}",
-            f"G {int(row.get('goals') or 0)}",
-            f"Ast {int(row.get('assists') or 0)}",
-            f"Saves {int(row.get('saves') or 0)}",
-            f"Stuns {int(row.get('stuns') or 0)}",
+            {"text": f"Pts {int(row.get('points') or 0)}"},
+            {"text": f"G {int(row.get('goals') or 0)}", "tooltip": detail_tooltips.get("goals", "")},
+            {"text": f"Ast {int(row.get('assists') or 0)}", "tooltip": detail_tooltips.get("assists", "")},
+            {"text": f"Saves {int(row.get('saves') or 0)}", "tooltip": detail_tooltips.get("saves", "")},
+            {"text": f"Stuns {int(row.get('stuns') or 0)}", "tooltip": detail_tooltips.get("stuns", "")},
         ]
         extra_chips = [
-            f"Pass {pass_count}",
-            f"TO {int(advanced.get('turnovers') or row.get('turnovers') or 0)}",
-            f"Int {int(advanced.get('interceptions') or row.get('interceptions') or 0)}",
-            f"Clr {int(advanced.get('clears') or 0)}",
-            f"Miss {int(advanced.get('missed_shots') or 0)}",
-            f"ShotSv {int(advanced.get('shots_saved') or 0)}",
+            {"text": f"Pass {pass_count}", "tooltip": detail_tooltips.get("passes", "")},
+            {"text": f"TO {int(advanced.get('turnovers') or row.get('turnovers') or 0)}", "tooltip": detail_tooltips.get("turnovers", "")},
+            {"text": f"Int {int(advanced.get('interceptions') or row.get('interceptions') or 0)}", "tooltip": detail_tooltips.get("interceptions", "")},
+            {"text": f"Clr {int(advanced.get('clears') or 0)}"},
+            {"text": f"Miss {int(advanced.get('missed_shots') or 0)}"},
+            {"text": f"ShotSv {int(advanced.get('shots_saved') or 0)}"},
             (
-                f"Sh% {float(advanced.get('shooting_percentage')):.1f}%"
+                {"text": f"Sh% {float(advanced.get('shooting_percentage')):.1f}%"}
                 if advanced.get("shooting_percentage") is not None
-                else "Sh% --"
+                else {"text": "Sh% --"}
             ),
         ]
         transition_chips = [
-            f"ToDef {float(advanced.get('avg_time_to_defense')):.2f}s"
+            {"text": f"ToDef {float(advanced.get('avg_time_to_defense')):.2f}s"}
             if advanced.get("avg_time_to_defense") is not None
-            else "ToDef --",
-            f"ToOff {float(advanced.get('avg_time_to_offense')):.2f}s"
+            else {"text": "ToDef --"},
+            {"text": f"ToOff {float(advanced.get('avg_time_to_offense')):.2f}s"}
             if advanced.get("avg_time_to_offense") is not None
-            else "ToOff --",
+            else {"text": "ToOff --"},
         ]
         subtitle_parts = []
         if row.get("userid"):
@@ -412,9 +417,38 @@ def _scoreboard_items(rows: List[Dict[str, Any]], show_roster_rows: bool) -> Lis
                 "subtitle": " | ".join(subtitle_parts),
                 "chip_rows": [base_chips, extra_chips, transition_chips],
                 "warning": " | ".join(warning_parts),
+                "radar_scores": radar_scores,
+                "radar_overall": advanced.get("display_overall_score")
+                if advanced.get("display_overall_score") is not None
+                else (overall_score_from_scores(radar_scores) if radar_scores else None),
+                "radar_details": category_breakdown,
             }
         )
     return items
+
+
+def _hide_low_activity_scoreboard_row(row: Dict[str, Any]) -> bool:
+    advanced = row.get("advanced_stats") or {}
+    base_activity = meaningful_stat_total(row)
+    advanced_activity = float(
+        int(advanced.get("completed_passes") or 0)
+        + int(advanced.get("inferred_catches") or 0)
+        + int(advanced.get("clears") or 0)
+        + int(advanced.get("turnovers") or 0)
+        + int(advanced.get("interceptions") or 0)
+        + int(advanced.get("missed_shots") or 0)
+        + int(advanced.get("shots_saved") or 0)
+        + int(advanced.get("blocked_shots") or 0)
+        + int(advanced.get("stuffed_shots") or 0)
+    )
+    active_seconds = float(advanced.get("active_seconds_observed") or 0.0)
+    active_rounds = float(advanced.get("active_rounds_estimated") or 0.0)
+    return (
+        base_activity <= 0.0
+        and advanced_activity <= 0.0
+        and active_rounds < 0.15
+        and active_seconds < 90.0
+    )
 
 
 def _detail_summary_text(match: Dict[str, Any], quality: Dict[str, Any], detail_quality: Dict[str, Any]) -> str:

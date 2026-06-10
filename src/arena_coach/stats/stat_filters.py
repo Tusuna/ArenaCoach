@@ -22,6 +22,7 @@ class StatsFilter:
     include_guest_players: bool = False
     private_match_type: Optional[str] = None
     private_match_types: tuple[str, ...] = ()
+    category_scoring_mode: str = "mistake_adjusted"
     from_date: Optional[date] = None
     to_date: Optional[date] = None
     last_n: Optional[int] = None

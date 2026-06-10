@@ -7,8 +7,9 @@ import subprocess
 from typing import Any, Callable, Optional
 
 from PySide6.QtCore import QThreadPool, QTimer, Qt, QUrl
-from PySide6.QtGui import QAction, QCloseEvent, QDesktopServices
+from PySide6.QtGui import QAction, QCloseEvent, QDesktopServices, QKeySequence
 from PySide6.QtWidgets import (
+    QApplication,
     QComboBox,
     QFileDialog,
     QFormLayout,
@@ -25,6 +26,7 @@ from PySide6.QtWidgets import (
 )
 
 from arena_coach.config import AppConfig
+from arena_coach.gui.theme import dark_theme
 from arena_coach.gui.widgets.capture_panel import CapturePanel
 from arena_coach.gui.widgets.match_history_panel import MatchHistoryPanel
 from arena_coach.gui.widgets.advanced_summary_panel import AdvancedSummaryPanel
@@ -85,6 +87,7 @@ class MainWindow(QMainWindow):
         self.tutorial_service = TutorialService(config.database_path)
         self.layout_service = LayoutService(config.database_path)
         self._layout_profile_id = self.layout_service.active_profile_id()
+        self._zoom_factor = self._read_zoom_factor()
 
         self.setWindowTitle("Arena Coach")
         self.resize(1420, 880)
@@ -147,6 +150,7 @@ class MainWindow(QMainWindow):
         self.tutorial_timer.timeout.connect(self.maybe_show_tutorial)
 
         self.refresh_all()
+        self._apply_zoom(self._zoom_factor, announce=False)
         self._update_layout_actions()
         self.startup_connection_timer.start(250)
         self.tutorial_timer.start(600)
@@ -237,9 +241,25 @@ class MainWindow(QMainWindow):
         view_menu.addAction(self.customize_layout_action)
         self.refresh_layout_action = QAction("Refresh Layout", self)
         self.refresh_layout_action.triggered.connect(self.refresh_current_tab_layout)
+        self.zoom_in_action = QAction("Zoom In", self)
+        self.zoom_in_action.setShortcuts([QKeySequence.ZoomIn])
+        self.zoom_in_action.setShortcutContext(Qt.ApplicationShortcut)
+        self.zoom_in_action.triggered.connect(lambda: self._step_zoom(+0.1))
+        self.zoom_out_action = QAction("Zoom Out", self)
+        self.zoom_out_action.setShortcuts([QKeySequence.ZoomOut])
+        self.zoom_out_action.setShortcutContext(Qt.ApplicationShortcut)
+        self.zoom_out_action.triggered.connect(lambda: self._step_zoom(-0.1))
+        self.zoom_reset_action = QAction("Reset Zoom", self)
+        self.zoom_reset_action.setShortcut(QKeySequence("Ctrl+0"))
+        self.zoom_reset_action.setShortcutContext(Qt.ApplicationShortcut)
+        self.zoom_reset_action.triggered.connect(self._reset_zoom)
         view_menu.addAction(self.reset_current_layout_action)
         view_menu.addAction(self.reset_all_layouts_action)
         view_menu.addAction(self.refresh_layout_action)
+        view_menu.addSeparator()
+        view_menu.addAction(self.zoom_in_action)
+        view_menu.addAction(self.zoom_out_action)
+        view_menu.addAction(self.zoom_reset_action)
 
     def _connect_signals(self) -> None:
         self.capture_panel.test_connection_requested.connect(self.test_connection)
@@ -639,6 +659,45 @@ class MainWindow(QMainWindow):
             panel = self.tabs.widget(index)
             if panel is not None:
                 self._refresh_panel_layout(panel)
+
+    def _read_zoom_factor(self) -> float:
+        app = QApplication.instance()
+        if app is None:
+            return 1.0
+        try:
+            return max(0.75, min(2.0, float(app.property("arena_coach_zoom") or 1.0)))
+        except (TypeError, ValueError):
+            return 1.0
+
+    def _step_zoom(self, delta: float) -> None:
+        self._apply_zoom(self._zoom_factor + delta)
+
+    def _reset_zoom(self) -> None:
+        self._apply_zoom(1.0)
+
+    def _apply_zoom(self, factor: float, *, announce: bool = True) -> None:
+        factor = max(0.75, min(2.0, round(float(factor), 2)))
+        if abs(factor - self._zoom_factor) < 0.001 and announce:
+            self.show_message(f"Zoom {int(round(factor * 100))}%")
+            return
+        self._zoom_factor = factor
+        app = QApplication.instance()
+        if app is not None:
+            app.setProperty("arena_coach_zoom", factor)
+            app.setStyleSheet(dark_theme(scale=factor))
+        for widget in self.findChildren(QWidget):
+            refresh = getattr(widget, "refresh_scale", None)
+            if callable(refresh):
+                refresh()
+        self._refresh_panel_layout(self.capture_panel)
+        self._refresh_panel_layout(self.history_panel)
+        self._refresh_panel_layout(self.stats_panel)
+        self._refresh_panel_layout(self.advanced_summary_panel)
+        self._refresh_panel_layout(self.comparison_panel)
+        self.updateGeometry()
+        self.adjustSize()
+        if announce:
+            self.show_message(f"Zoom {int(round(factor * 100))}%")
 
     def _toggle_customize_current_tab(self, checked: bool) -> None:
         panel = self._supported_layout_tab()

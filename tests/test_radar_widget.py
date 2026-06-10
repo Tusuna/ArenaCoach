@@ -25,18 +25,18 @@ class RadarWidgetHelperTests(unittest.TestCase):
     def test_category_score_extraction_and_overall_average(self):
         scores = category_scores_from_breakdown(
             {
-                "shooting": {"overall_score": 64.8},
-                "speed": {"overall_score": 55.5},
-                "possession": {"overall_score": 48.5},
-                "offense": {"overall_score": 68.2},
-                "defense": {"overall_score": 52.1},
-                "passing": {"overall_score": 64.0},
+                "shooting": {"display_score": 74.8, "overall_score": 64.8},
+                "speed": {"display_score": 65.5, "overall_score": 55.5},
+                "possession": {"display_score": 58.5, "overall_score": 48.5},
+                "offense": {"display_score": 78.2, "overall_score": 68.2},
+                "defense": {"display_score": 62.1, "overall_score": 52.1},
+                "passing": {"display_score": 74.0, "overall_score": 64.0},
             }
         )
-        self.assertEqual(scores["shooting"], 64.8)
-        self.assertEqual(scores["speed"], 55.5)
-        self.assertEqual(scores["passing"], 64.0)
-        self.assertAlmostEqual(overall_score_from_scores(scores), 58.85)
+        self.assertEqual(scores["shooting"], 74.8)
+        self.assertEqual(scores["speed"], 65.5)
+        self.assertEqual(scores["passing"], 74.0)
+        self.assertAlmostEqual(overall_score_from_scores(scores), 68.85)
 
     def test_missing_scores_are_ignored_in_overall_average(self):
         scores = category_scores_from_breakdown(
@@ -47,6 +47,17 @@ class RadarWidgetHelperTests(unittest.TestCase):
         )
         self.assertIsNone(scores["defense"])
         self.assertAlmostEqual(overall_score_from_scores(scores), 70.0)
+
+    def test_can_force_absolute_scores_when_needed(self):
+        scores = category_scores_from_breakdown(
+            {
+                "shooting": {"display_score": 92.0, "overall_score": 80.0},
+                "speed": {"display_score": 76.0, "overall_score": 60.0},
+            },
+            preferred_key="overall_score",
+        )
+        self.assertEqual(scores["shooting"], 80.0)
+        self.assertEqual(scores["speed"], 60.0)
 
 
 if __name__ == "__main__":

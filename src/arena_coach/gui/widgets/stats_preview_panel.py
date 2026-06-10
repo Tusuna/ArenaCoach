@@ -18,6 +18,7 @@ from arena_coach.gui.widgets.card_container import CardContainer
 from arena_coach.gui.widgets.compact_card_list import CompactCardList
 from arena_coach.gui.widgets.multi_select_menu_button import MultiSelectMenuButton
 from arena_coach.match_context import PRIVATE_MATCH_TYPES, private_match_type_label
+from arena_coach.services.advanced_analysis_service import AdvancedAnalysisService
 from arena_coach.services.layout_service import LayoutService
 from arena_coach.services.stats_preview_service import StatsPreviewService
 from arena_coach.stats.stat_filters import StatsFilter
@@ -29,6 +30,7 @@ class StatsPreviewPanel(QWidget):
     def __init__(self, service: StatsPreviewService, layout_service: LayoutService) -> None:
         super().__init__()
         self.service = service
+        self.advanced_service = AdvancedAnalysisService(service.database_path)
         self.layout_service = layout_service
 
         self.competitive_only = QCheckBox("Competitive only")
@@ -47,6 +49,9 @@ class StatsPreviewPanel(QWidget):
         )
         self.last_filter = QComboBox()
         self.last_filter.addItems(["All", "5", "10", "25"])
+        self.scoring_mode = QComboBox()
+        self.scoring_mode.addItem("Mistake Adjusted", "mistake_adjusted")
+        self.scoring_mode.addItem("Production Only", "production_only")
         self.include_guests = QCheckBox("Include guests")
         self.include_afk = QCheckBox("Include suspected AFK")
         self.refresh_button = QPushButton("Refresh")
@@ -69,6 +74,7 @@ class StatsPreviewPanel(QWidget):
         playstyle_layout.addWidget(self.playstyle_label)
         playstyle_layout.addWidget(self.playstyle_note)
         playstyle_layout.addWidget(self.low_sample_label)
+        self.category_snapshot = CompactCardList("No category scores yet.")
 
         self.trends_list = CompactCardList("No trends yet.")
         self.rivals_list = CompactCardList("No rival data yet.")
@@ -82,6 +88,7 @@ class StatsPreviewPanel(QWidget):
         self.cards.add_card("profile_summary", "Profile Summary", self.summary_widget)
         self.cards.add_card("match_quality_summary", "Match Quality Summary", self.quality_widget)
         self.cards.add_card("playstyle_guess", "Playstyle Guess", self.playstyle_widget)
+        self.cards.add_card("category_snapshot", "Category Snapshot", self.category_snapshot)
         self.cards.add_card("recent_trends", "Recent Trends", self.trends_list)
         self.cards.add_card("top_rivals", "Top Rivals", self.rivals_list)
         self.cards.add_card("best_teammates", "Best Teammates", self.teammates_list)
@@ -96,6 +103,8 @@ class StatsPreviewPanel(QWidget):
         filters.addWidget(self.private_type_filter)
         filters.addWidget(QLabel("Last"))
         filters.addWidget(self.last_filter)
+        filters.addWidget(QLabel("Scoring"))
+        filters.addWidget(self.scoring_mode)
         filters.addWidget(self.include_guests)
         filters.addWidget(self.include_afk)
         filters.addStretch()
@@ -122,6 +131,7 @@ class StatsPreviewPanel(QWidget):
         self.classification_filter.selection_changed.connect(self._classification_filter_changed)
         self.private_type_filter.selection_changed.connect(self.reload)
         self.last_filter.currentIndexChanged.connect(self.reload)
+        self.scoring_mode.currentIndexChanged.connect(self.reload)
         self.include_guests.stateChanged.connect(self.reload)
         self.include_afk.stateChanged.connect(self.reload)
         self.customize_button.toggled.connect(self.set_customize_layout)
@@ -132,7 +142,9 @@ class StatsPreviewPanel(QWidget):
         self.reload()
 
     def reload(self) -> None:
-        payload = self.service.preview(self._filters())
+        filters = self._filters()
+        payload = self.service.preview(filters)
+        advanced = self.advanced_service.local_user_summary(filters=filters)
         summary = payload.get("summary") or {}
         quality = payload.get("quality") or {}
         trends = payload.get("trends") or {}
@@ -142,6 +154,7 @@ class StatsPreviewPanel(QWidget):
         self._load_summary(summary)
         self._load_quality(summary, quality)
         self._load_playstyle(summary.get("playstyle") or payload.get("playstyle") or {})
+        self._load_category_snapshot(advanced.get("category_breakdown") or {})
         self._load_trends(trends.get("metrics") or [])
         self._load_rivals(matchups.get("top_rivals") or matchups.get("rows") or [])
         self._load_teammates(teammates.get("best_teammates") or teammates.get("rows") or [])
@@ -223,6 +236,7 @@ class StatsPreviewPanel(QWidget):
             include_afk_players=self.include_afk.isChecked(),
             private_match_types=tuple(selected_private_types),
             last_n=last_n,
+            category_scoring_mode=str(self.scoring_mode.currentData() or "mistake_adjusted"),
         )
 
     def _load_summary(self, summary: dict[str, object]) -> None:
@@ -276,6 +290,49 @@ class StatsPreviewPanel(QWidget):
                 }
             )
         self.trends_list.set_items(items)
+
+    def _load_category_snapshot(self, category_breakdown: dict[str, object]) -> None:
+        items = []
+        for key, label in (
+            ("shooting", "Shooting"),
+            ("speed", "Speed"),
+            ("possession", "Possession"),
+            ("offense", "Offense"),
+            ("defense", "Defense"),
+            ("passing", "Passing"),
+        ):
+            category = category_breakdown.get(key) if isinstance(category_breakdown, dict) else None
+            if not isinstance(category, dict):
+                continue
+            display_score = category.get("display_score")
+            final_score = category.get("final_score")
+            base_score = category.get("base_score")
+            penalty = category.get("mistake_penalty")
+            confidence_label = str(category.get("confidence_label") or "unknown").title()
+            rounds = category.get("rounds_considered")
+            subtitle = str(category.get("explanation") or "").strip()
+            chips = []
+            if display_score is not None:
+                chips.append(f"Display {float(display_score):.1f}")
+            if final_score is not None:
+                chips.append(f"Absolute {float(final_score):.1f}")
+            if base_score is not None:
+                chips.append(f"Base {float(base_score):.1f}")
+            if penalty is not None:
+                chips.append(f"Penalty -{float(penalty):.1f}")
+            if rounds is not None:
+                chips.append(f"{confidence_label} ({float(rounds):.2f} rd)")
+            issues = list(category.get("main_mistake_inputs") or [])
+            warning = f"Main issues: {', '.join(issues[:3])}" if issues else ""
+            items.append(
+                {
+                    "title": label,
+                    "subtitle": subtitle,
+                    "chips": chips,
+                    "warning": warning,
+                }
+            )
+        self.category_snapshot.set_items(items)
 
     def _load_rivals(self, rows: list[dict[str, object]]) -> None:
         items = []

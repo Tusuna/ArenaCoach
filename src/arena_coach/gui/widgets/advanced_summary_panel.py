@@ -67,6 +67,9 @@ class AdvancedSummaryPanel(QWidget):
         )
         self.last_filter = QComboBox()
         self.last_filter.addItems(["All", "5", "10", "25"])
+        self.scoring_mode = QComboBox()
+        self.scoring_mode.addItem("Mistake Adjusted", "mistake_adjusted")
+        self.scoring_mode.addItem("Production Only", "production_only")
         self.include_afk = QCheckBox("Include suspected AFK")
         self.refresh_button = QPushButton("Refresh")
         self.customize_button = QPushButton("Customize Layout")
@@ -79,7 +82,7 @@ class AdvancedSummaryPanel(QWidget):
         overview_shell.setSpacing(16)
         self.overview_form_widget = QWidget()
         self.overview_layout = QFormLayout(self.overview_form_widget)
-        self.overview_chart = CategoryRadarWidget("#7ce7ff")
+        self.overview_chart = CategoryRadarWidget("#7ce7ff", show_axis_grades=False)
         overview_shell.addWidget(self.overview_form_widget, 2)
         overview_shell.addWidget(self.overview_chart, 3)
         self.transition_widget = QWidget()
@@ -123,6 +126,8 @@ class AdvancedSummaryPanel(QWidget):
         filters.addWidget(self.private_type_filter)
         filters.addWidget(QLabel("Last"))
         filters.addWidget(self.last_filter)
+        filters.addWidget(QLabel("Scoring"))
+        filters.addWidget(self.scoring_mode)
         filters.addWidget(self.include_afk)
         filters.addStretch()
         filters.addWidget(self.reset_layout_button)
@@ -149,6 +154,7 @@ class AdvancedSummaryPanel(QWidget):
         self.classification_filter.selection_changed.connect(self._classification_filter_changed)
         self.private_type_filter.selection_changed.connect(self.reload)
         self.last_filter.currentIndexChanged.connect(self.reload)
+        self.scoring_mode.currentIndexChanged.connect(self.reload)
         self.include_afk.stateChanged.connect(self.reload)
         self.customize_button.toggled.connect(self.set_customize_layout)
         self.reset_layout_button.clicked.connect(self._handle_reset_layout)
@@ -243,6 +249,7 @@ class AdvancedSummaryPanel(QWidget):
             include_afk_players=self.include_afk.isChecked(),
             private_match_types=tuple(selected_private_types),
             last_n=last_n,
+            category_scoring_mode=str(self.scoring_mode.currentData() or "mistake_adjusted"),
         )
 
     def _load_overview(self, payload: dict) -> None:
@@ -258,6 +265,21 @@ class AdvancedSummaryPanel(QWidget):
             _label(", ".join(str(name) for name in player_names) if player_names else "not linked yet"),
         )
         self.overview_layout.addRow("confidence view", _label(", ".join(payload.get("confidence_levels") or [])))
+        self.overview_layout.addRow(
+            "category scoring",
+            _label(str(payload.get("category_scoring_mode") or "mistake_adjusted").replace("_", " ").title()),
+        )
+        if payload.get("display_overall_score") is not None:
+            self.overview_layout.addRow("display rating", _label(f"{float(payload.get('display_overall_score')):.1f}"))
+        if payload.get("absolute_overall_score") is not None:
+            self.overview_layout.addRow("absolute rating", _label(f"{float(payload.get('absolute_overall_score')):.1f}"))
+        if payload.get("display_percentile") is not None:
+            self.overview_layout.addRow(
+                "relative percentile",
+                _label(f"{float(payload.get('display_percentile')):.1f}"),
+            )
+        if payload.get("display_reference_count") is not None:
+            self.overview_layout.addRow("reference rows", _label(payload.get("display_reference_count", 0)))
         self.overview_layout.addRow("finalized matches", _label(payload.get("total_finalized_matches", 0)))
         self.overview_layout.addRow("matches with advanced data", _label(payload.get("matches_with_advanced_data", 0)))
         self.overview_layout.addRow("event round samples", _label(_round_sample_text(payload.get("total_rounds_considered", 0))))
@@ -292,7 +314,10 @@ class AdvancedSummaryPanel(QWidget):
         self.overview_chart.set_scores(
             radar_scores,
             overall_label="Overall",
-            overall_score=overall_score_from_scores(radar_scores),
+            overall_score=payload.get("display_overall_score")
+            if payload.get("display_overall_score") is not None
+            else overall_score_from_scores(radar_scores),
+            category_details=category_breakdown,
         )
 
     def _load_transitions(self, transitions: dict) -> None:
@@ -315,14 +340,52 @@ class AdvancedSummaryPanel(QWidget):
         if not category:
             layout.addRow("status", _label("No data yet."))
             return
-        overall_score = category.get("overall_score")
-        if overall_score is not None:
-            layout.addRow("overall score", _label(f"{float(overall_score):.1f}"))
+        display_score = category.get("display_score")
+        if display_score is not None:
+            layout.addRow("display score", _label(f"{float(display_score):.1f}"))
+        final_score = category.get("final_score")
+        if final_score is not None:
+            layout.addRow("absolute score", _label(f"{float(final_score):.1f}"))
+        display_percentile = category.get("display_percentile")
+        if display_percentile is not None:
+            layout.addRow("relative percentile", _label(f"{float(display_percentile):.1f}"))
+        layout.addRow("confidence", _label(_confidence_text(category)))
+        base_score = category.get("base_score")
+        if base_score is not None:
+            layout.addRow("base production", _label(f"{float(base_score):.1f}"))
+        layout.addRow("mistake penalty", _label(f"-{float(category.get('mistake_penalty', 0.0)):.1f}"))
+        mistake_adjusted = category.get("mistake_adjusted_score")
+        if mistake_adjusted is not None:
+            layout.addRow("mistake-adjusted", _label(f"{float(mistake_adjusted):.1f}"))
+        positives = ", ".join(category.get("main_positive_inputs") or [])
+        if positives:
+            layout.addRow("main positives", _label(positives))
+        issues = ", ".join(category.get("main_mistake_inputs") or [])
+        if issues:
+            layout.addRow("main issues", _label(issues))
+        explanation = str(category.get("explanation") or "").strip()
+        if explanation:
+            layout.addRow("explanation", _label(explanation))
         note = str(category.get("score_note") or "").strip()
         if note:
             layout.addRow("note", _label(note))
+        summary_labels = {
+            "Scoring mode",
+            "Final score",
+            "Base production score",
+            "Mistake penalty",
+            "Mistake-adjusted score",
+            "Rounds considered",
+            "Sample confidence",
+            "Raw category value",
+            "Main positives",
+            "Main issues",
+            "Explanation",
+        }
         for metric in category.get("metrics") or []:
             label = str(metric.get("label") or "metric")
+            if label in summary_labels:
+                continue
             value = str(metric.get("value") or "")
             note_value = str(metric.get("note") or "").strip()
             if note_value:
@@ -394,3 +457,15 @@ def _warning_label(text: str) -> QLabel:
     label.setWordWrap(True)
     label.setStyleSheet("color: #ff7a7a;")
     return label
+
+
+def _confidence_text(category: dict) -> str:
+    label = str(category.get("confidence_label") or "unknown")
+    confidence = category.get("sample_confidence")
+    rounds = category.get("rounds_considered")
+    parts = [label.title()]
+    if confidence is not None:
+        parts.append(f"{float(confidence):.2f}")
+    if rounds is not None:
+        parts.append(f"{float(rounds):.2f} rounds")
+    return " | ".join(parts)

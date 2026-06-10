@@ -103,7 +103,16 @@ def derive_team_split_stats(
         assessment = _match_assessment(row, by_name)
         if assessment is not None:
             row["metadata"]["afk_detection"] = assessment
-        row["metadata"]["active_participation"] = has_meaningful_participation(row["stats"], row["metadata"])
+        row_live_samples = int(row["metadata"].get("live_samples") or 0)
+        single_team_identity = len(identities_to_rows.get(row["identity"], [])) <= 1
+        row["metadata"]["active_participation"] = bool(
+            meaningful_stat_total(row["stats"]) > 0
+            or (
+                single_team_identity
+                and row_live_samples >= 120
+                and not bool((assessment or {}).get("suspected"))
+            )
+        )
         row["metadata"]["meaningful"] = row["metadata"]["active_participation"]
         row["metadata"]["identity"] = row["identity"]
         row["metadata"]["stat_total"] = meaningful_stat_total(row["stats"])

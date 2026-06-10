@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
@@ -11,9 +11,12 @@ from PySide6.QtWidgets import (
     QLabel,
     QScrollArea,
     QSizePolicy,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
+
+from arena_coach.gui.widgets.category_radar_widget import CategoryRadarWidget, grade_for_score, overall_score_from_scores
 
 
 class CompactCardList(QWidget):
@@ -99,20 +102,20 @@ class _CompactCard(QFrame):
         chip_rows = item.get("chip_rows")
         if chip_rows:
             normalized_rows = [
-                [str(chip) for chip in row if str(chip).strip()]
+                [_chip_spec(chip) for chip in row if _chip_spec(chip) is not None]
                 for row in chip_rows
                 if row
             ]
         else:
-            chip_values = [str(chip) for chip in item.get("chips") or [] if str(chip).strip()]
-            normalized_rows = _chunked(chip_values, 5)
-        for chip_values in normalized_rows:
+            chip_values = [_chip_spec(chip) for chip in item.get("chips") or []]
+            normalized_rows = _chunked([chip for chip in chip_values if chip is not None], 5)
+        for chip_specs in normalized_rows:
             row_widget = QWidget()
             row_layout = QHBoxLayout(row_widget)
             row_layout.setContentsMargins(0, 0, 0, 0)
             row_layout.setSpacing(6)
             row_layout.setAlignment(Qt.AlignLeft)
-            for chip in chip_values:
+            for chip in chip_specs:
                 row_layout.addWidget(_chip(chip))
             row_layout.addStretch()
             chips_root.addWidget(row_widget)
@@ -124,21 +127,60 @@ class _CompactCard(QFrame):
         warning.setVisible(bool(warning_value))
         warning.setStyleSheet("color: #ff7a7a;")
 
+        text_column = QWidget()
+        text_layout = QVBoxLayout(text_column)
+        text_layout.setContentsMargins(0, 0, 0, 0)
+        text_layout.setSpacing(5)
+        text_layout.addWidget(title)
+        text_layout.addWidget(subtitle)
+        text_layout.addWidget(chips_widget)
+        text_layout.addWidget(warning)
+
+        body_layout = QHBoxLayout()
+        body_layout.setContentsMargins(10, 8, 10, 8)
+        body_layout.setSpacing(10)
+        body_layout.addWidget(text_column, 1)
+
+        radar_scores = item.get("radar_scores")
+        if isinstance(radar_scores, Mapping) and radar_scores:
+            radar = CategoryRadarWidget(
+                "#7ce7ff",
+                show_header=True,
+                show_axis_labels=True,
+                show_axis_grades=False,
+                compact=True,
+            )
+            radar.setBaseSize(228, 228)
+            radar.set_base_fixed_size(228)
+            radar.set_scores(
+                radar_scores,
+                overall_label="Match",
+                overall_score=item.get("radar_overall"),
+                category_details=item.get("radar_details") if isinstance(item.get("radar_details"), Mapping) else None,
+            )
+            radar.setToolTip(str(item.get("radar_tooltip") or _radar_tooltip(radar_scores)))
+            body_layout.addWidget(radar, 0, Qt.AlignTop)
+
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 8, 10, 8)
-        layout.setSpacing(5)
-        layout.addWidget(title)
-        layout.addWidget(subtitle)
-        layout.addWidget(chips_widget)
-        layout.addWidget(warning)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addLayout(body_layout)
 
 
-def _chip(text: str) -> QLabel:
-    label = QLabel(text)
-    label.setStyleSheet(
-        "padding: 3px 8px; border: 1px solid #2f4861; border-radius: 6px; color: #d7f7ff; background: #142333;"
+def _chip(spec: Mapping[str, str]) -> QToolButton:
+    button = QToolButton()
+    button.setText(str(spec.get("text") or ""))
+    button.setFocusPolicy(Qt.NoFocus)
+    button.setCursor(Qt.PointingHandCursor)
+    button.setAutoRaise(False)
+    button.setStyleSheet(
+        "QToolButton { padding: 3px 8px; border: 1px solid #2f4861; border-radius: 6px; color: #d7f7ff; background: #142333; }"
+        "QToolButton:hover { border-color: #55d6ff; background: #183044; }"
     )
-    return label
+    tooltip = str(spec.get("tooltip") or "").strip()
+    if tooltip:
+        button.setToolTip(tooltip)
+        button.clicked.connect(lambda _checked=False, widget=button, text=tooltip: _show_chip_tooltip(widget, text))
+    return button
 
 
 def _empty_label(text: str) -> QLabel:
@@ -159,7 +201,53 @@ def _clear_layout(layout: QVBoxLayout) -> None:
             _clear_layout(child_layout)  # type: ignore[arg-type]
 
 
-def _chunked(values: Sequence[str], size: int) -> list[list[str]]:
+def _chunked(values: Sequence[Any], size: int) -> list[list[Any]]:
     if not values:
         return []
     return [list(values[index : index + size]) for index in range(0, len(values), size)]
+
+
+def _chip_spec(value: Any) -> Mapping[str, str] | None:
+    if value is None:
+        return None
+    if isinstance(value, Mapping):
+        text = str(value.get("text") or "").strip()
+        if not text:
+            return None
+        return {
+            "text": text,
+            "tooltip": str(value.get("tooltip") or "").strip(),
+        }
+    text = str(value).strip()
+    if not text:
+        return None
+    return {"text": text, "tooltip": ""}
+
+
+def _show_chip_tooltip(widget: QWidget, text: str) -> None:
+    if not text:
+        return
+    global_pos = widget.mapToGlobal(widget.rect().bottomLeft())
+    from PySide6.QtWidgets import QToolTip
+
+    QToolTip.showText(global_pos, text, widget)
+
+
+def _radar_tooltip(scores: Mapping[str, Any]) -> str:
+    overall = overall_score_from_scores(scores)
+    lines = []
+    if overall is not None:
+        lines.append(f"Match-only overall: {float(overall):.1f} ({grade_for_score(overall)})")
+    for key, label in (
+        ("shooting", "Shooting"),
+        ("speed", "Speed"),
+        ("possession", "Possession"),
+        ("offense", "Offense"),
+        ("defense", "Defense"),
+        ("passing", "Passing"),
+    ):
+        value = scores.get(key)
+        if value is None:
+            continue
+        lines.append(f"{label}: {float(value):.1f} ({grade_for_score(value)})")
+    return "\n".join(lines)
